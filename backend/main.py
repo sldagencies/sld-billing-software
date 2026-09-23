@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -119,7 +119,9 @@ class PriceAdjustRequest(BaseModel):
 def generate_bill_number():
     today = datetime.now()
     prefix = f"SLD{today.strftime('%y%m')}"
-    result = supabase.table("bills").select("bill_number").ilike("bill_number", f"{prefix}%").order("bill_number", desc=True).limit(1).execute()
+    result = supabase.table("bills").select("bill_number").ilike(
+        "bill_number", f"{prefix}%"
+    ).order("bill_number", desc=True).limit(1).execute()
     if result.data:
         last = result.data[0]["bill_number"]
         try:
@@ -130,28 +132,39 @@ def generate_bill_number():
         seq = 1
     return f"{prefix}{seq:04d}"
 
-# ── FIXED SEARCH — shows items even with price 0, handles New Items tab row 2 ──
+# ── MAIN TABS (rows start at 4) ──────────────────────
+MAIN_TABS = [
+    "PVC", "CPVC", "UPVC", "SWR Drainage", "GI & Brass",
+    "Motors & Pumps", "Water Tanks", "Sanitary Ware",
+    "Taps & Valves", "Column Pipes", "Solvents", "Miscellaneous"
+]
+
+# ── FIXED SEARCH — ONE batchGet call instead of 13 separate calls ──
 @app.get("/api/products/search")
 def search_products(q: str, user=Depends(verify_token)):
     if not q or len(q) < 2:
         return []
+
     sheets = get_sheets_service()
-    tabs = [
-        "PVC", "CPVC", "UPVC", "SWR Drainage", "GI & Brass",
-        "Motors & Pumps", "Water Tanks", "Sanitary Ware",
-        "Taps & Valves", "Column Pipes", "Solvents",
-        "Miscellaneous", "New Items"
-    ]
-    results = []
     q_lower = q.lower()
-    for tab in tabs:
-        try:
-            start_row = 2 if tab == "New Items" else 4
-            resp = sheets.values().get(
-                spreadsheetId=SHEET_ID,
-                range=f"'{tab}'!A{start_row}:D1000"
-            ).execute()
-            rows = resp.get("values", [])
+    results = []
+
+    # Build all ranges in ONE request — 1 API call for main tabs
+    ranges = [f"'{tab}'!A4:D500" for tab in MAIN_TABS]
+    ranges.append("'New Items'!A2:D500")  # New Items starts at row 2
+
+    try:
+        resp = sheets.values().batchGet(
+            spreadsheetId=SHEET_ID,
+            ranges=ranges
+        ).execute()
+
+        value_ranges = resp.get("valueRanges", [])
+        all_tabs = MAIN_TABS + ["New Items"]
+
+        for i, vr in enumerate(value_ranges):
+            tab = all_tabs[i] if i < len(all_tabs) else "Unknown"
+            rows = vr.get("values", [])
             for row in rows:
                 if len(row) >= 2:
                     item_name = str(row[1]).strip() if len(row) > 1 else ""
@@ -161,7 +174,7 @@ def search_products(q: str, user=Depends(verify_token)):
                         price = float(price_raw.replace(",", ""))
                     except:
                         price = 0.0
-                    skip = ["—", "", "Item", "item", "Product", "ITEM"]
+                    skip = ["—", "", "Item", "item", "Product", "ITEM", "S. No"]
                     if q_lower in item_name.lower() and item_name not in skip:
                         results.append({
                             "item_name": item_name,
@@ -169,12 +182,12 @@ def search_products(q: str, user=Depends(verify_token)):
                             "price": price,
                             "tab": tab
                         })
-        except Exception as e:
-            print(f"Tab error {tab}: {e}")
-            continue
+    except Exception as e:
+        print(f"BatchGet error: {e}")
+        return []
+
     return results[:20]
 
-# ── FIXED NEW ITEM — adds to row 2 onwards in New Items tab ──
 @app.post("/api/products/new")
 def add_new_item(item: NewItemRequest, user=Depends(verify_token)):
     sheets = get_sheets_service()
@@ -184,15 +197,14 @@ def add_new_item(item: NewItemRequest, user=Depends(verify_token)):
             range="'New Items'!A:D"
         ).execute()
         rows = resp.get("values", [])
-        next_row = max(len(rows) + 1, 2)
-        sno = next_row - 1
+        sno = max(len(rows), 1)
         sheets.values().append(
             spreadsheetId=SHEET_ID,
             range="'New Items'!A:D",
             valueInputOption="USER_ENTERED",
             body={"values": [[sno, item.item_name, item.unit, item.price]]}
         ).execute()
-        return {"message": f"'{item.item_name}' added to New Items tab", "item": item.item_name}
+        return {"message": f"'{item.item_name}' added to New Items tab"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -202,7 +214,10 @@ def adjust_prices(req: PriceAdjustRequest, user=Depends(verify_token)):
         raise HTTPException(status_code=403, detail="Owner access only")
     sheets = get_sheets_service()
     try:
-        resp = sheets.values().get(spreadsheetId=SHEET_ID, range=f"'{req.tab_name}'!A4:D1000").execute()
+        resp = sheets.values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"'{req.tab_name}'!A4:D1000"
+        ).execute()
         rows = resp.get("values", [])
         updates = []
         for i, row in enumerate(rows):
@@ -214,11 +229,17 @@ def adjust_prices(req: PriceAdjustRequest, user=Depends(verify_token)):
                             new_price = round(old_price * (1 + req.adjustment_value / 100), 2)
                         else:
                             new_price = round(old_price + req.adjustment_value, 2)
-                        updates.append({"range": f"'{req.tab_name}'!D{i + 4}", "values": [[new_price]]})
+                        updates.append({
+                            "range": f"'{req.tab_name}'!D{i + 4}",
+                            "values": [[new_price]]
+                        })
                 except:
                     continue
         if updates:
-            sheets.values().batchUpdate(spreadsheetId=SHEET_ID, body={"valueInputOption": "USER_ENTERED", "data": updates}).execute()
+            sheets.values().batchUpdate(
+                spreadsheetId=SHEET_ID,
+                body={"valueInputOption": "USER_ENTERED", "data": updates}
+            ).execute()
         return {"message": f"Updated {len(updates)} prices in {req.tab_name}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -246,8 +267,10 @@ def create_bill(bill: Bill, user=Depends(verify_token)):
         cust = existing.data[0]
         supabase.table("customers").update({
             "total_purchases": cust["total_purchases"] + bill.grand_total,
-            "outstanding_credit": cust["outstanding_credit"] + (bill.grand_total if bill.payment_status == "credit" else 0),
-            "bill_count": cust["bill_count"] + 1, "last_purchase": now
+            "outstanding_credit": cust["outstanding_credit"] + (
+                bill.grand_total if bill.payment_status == "credit" else 0),
+            "bill_count": cust["bill_count"] + 1,
+            "last_purchase": now
         }).eq("phone", bill.customer_phone).execute()
     else:
         supabase.table("customers").insert({
@@ -260,7 +283,8 @@ def create_bill(bill: Bill, user=Depends(verify_token)):
         supabase.table("credit_reminders").insert({
             "bill_id": result.data[0]["id"], "bill_number": bill_number,
             "customer_name": bill.customer_name, "customer_phone": bill.customer_phone,
-            "amount": bill.grand_total, "reminder_count": 0, "status": "active", "created_at": now
+            "amount": bill.grand_total, "reminder_count": 0,
+            "status": "active", "created_at": now
         }).execute()
     return {"bill_number": bill_number, "id": result.data[0]["id"]}
 
@@ -272,7 +296,9 @@ def get_bills(status: Optional[str] = None, search: Optional[str] = None,
     if status:
         query = query.eq("payment_status", status)
     if search:
-        query = query.or_(f"customer_name.ilike.%{search}%,bill_number.ilike.%{search}%,customer_phone.ilike.%{search}%")
+        query = query.or_(
+            f"customer_name.ilike.%{search}%,bill_number.ilike.%{search}%,customer_phone.ilike.%{search}%"
+        )
     if from_date:
         query = query.gte("created_at", from_date)
     if to_date:
@@ -282,7 +308,8 @@ def get_bills(status: Optional[str] = None, search: Optional[str] = None,
 
 @app.get("/api/bills/pinned")
 def get_pinned_bills(user=Depends(verify_token)):
-    result = supabase.table("bills").select("*").eq("is_pinned", True).order("created_at", desc=True).limit(20).execute()
+    result = supabase.table("bills").select("*").eq(
+        "is_pinned", True).order("created_at", desc=True).limit(20).execute()
     return result.data
 
 @app.get("/api/bills/{bill_id}")
@@ -306,7 +333,8 @@ def update_payment(bill_id: str, payment_status: str, payment_method: str,
         "paid_at": datetime.now().isoformat() if payment_status == "paid" else None
     }).eq("id", bill_id).execute()
     if payment_status == "paid":
-        supabase.table("credit_reminders").update({"status": "stopped"}).eq("bill_id", bill_id).execute()
+        supabase.table("credit_reminders").update(
+            {"status": "stopped"}).eq("bill_id", bill_id).execute()
     return {"message": "Payment updated"}
 
 @app.delete("/api/bills/{bill_id}")
@@ -338,7 +366,8 @@ def create_return(bill_id: str, ret: ReturnBill, user=Depends(verify_token)):
 
 @app.get("/api/bills/{bill_id}/returns")
 def get_returns(bill_id: str, user=Depends(verify_token)):
-    result = supabase.table("return_bills").select("*").eq("original_bill_id", bill_id).execute()
+    result = supabase.table("return_bills").select("*").eq(
+        "original_bill_id", bill_id).execute()
     return result.data
 
 @app.get("/api/dashboard")
@@ -348,7 +377,8 @@ def get_dashboard(user=Depends(verify_token)):
     today_data = today_bills.data or []
     credit_bills = supabase.table("bills").select("*").eq("payment_status", "credit").execute()
     credit_data = credit_bills.data or []
-    pinned = supabase.table("bills").select("*").eq("is_pinned", True).order("created_at", desc=True).limit(10).execute()
+    pinned = supabase.table("bills").select("*").eq(
+        "is_pinned", True).order("created_at", desc=True).limit(10).execute()
     return {
         "today_sales": sum(b["grand_total"] for b in today_data),
         "today_bill_count": len(today_data),
@@ -397,12 +427,14 @@ def get_customers(search: Optional[str] = None, user=Depends(verify_token)):
 
 @app.get("/api/customers/{phone}/bills")
 def get_customer_bills(phone: str, user=Depends(verify_token)):
-    result = supabase.table("bills").select("*").eq("customer_phone", phone).order("created_at", desc=True).execute()
+    result = supabase.table("bills").select("*").eq(
+        "customer_phone", phone).order("created_at", desc=True).execute()
     return result.data
 
 @app.get("/api/credit-reminders")
 def get_reminders(user=Depends(verify_token)):
-    result = supabase.table("credit_reminders").select("*").eq("status", "active").order("created_at", desc=True).execute()
+    result = supabase.table("credit_reminders").select("*").eq(
+        "status", "active").order("created_at", desc=True).execute()
     return result.data
 
 @app.get("/api/health")
