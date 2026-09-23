@@ -27,24 +27,58 @@ app.add_middleware(
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-def get_sheets_service():
-    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
-    creds_dict = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    service = build("sheets", "v4", credentials=creds)
-    return service.spreadsheets()
-
 SECRET_KEY = os.getenv("JWT_SECRET", "sld-billing-secret-2024")
 security = HTTPBearer()
-
 USERS = {
     "owner": {"password": os.getenv("OWNER_PASSWORD", "owner123"), "role": "owner"},
     "worker": {"password": os.getenv("WORKER_PASSWORD", "worker123"), "role": "worker"},
 }
+
+def get_sheets_service():
+    creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+    creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    return build("sheets", "v4", credentials=creds).spreadsheets()
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        return jwt.decode(credentials.credentials, SECRET_KEY, algorithms=["HS256"])
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ── Smart tab detection — searches only relevant tabs ──
+TAB_KEYWORDS = {
+    "PVC":           ["pvc", "agri", "agriculture", "saddle", "reducer", "plug", "repair coupler"],
+    "CPVC":          ["cpvc", "concealed", "wall mixture"],
+    "UPVC":          ["upvc"],
+    "SWR Drainage":  ["swr", "drain", "asaid", "nahan", "multi trap", "door elbow", "door tee"],
+    "GI & Brass":    ["gi pipe", "galvanised", "gi elbow", "gi tee", "gi coupler", "gi union",
+                      "brass ball", "brass nrv", "hose bend", "hose nipple", "check valve", "brass"],
+    "Motors & Pumps":["motor", "pump", "hp cri", "cri", "monoblock", "submersible", "bore", "agri pump"],
+    "Water Tanks":   ["tank", "plasto", "truflo", "ruf", "foam", "nandi", "litre", "lit"],
+    "Sanitary Ware": ["basin", "western", "indian", "flush", "wash basin", "pedestal", "commode"],
+    "Taps & Valves": ["tap", "valve", "cock", "gate", "stop cock", "angle", "pillar", "bib"],
+    "Column Pipes":  ["column pipe", "column"],
+    "Solvents":      ["solvent", "ptfe", "tape", "sealant", "silicone", "epoxy", "cement"],
+    "Miscellaneous": [],
+}
+
+def get_relevant_tabs(q: str) -> List[str]:
+    q_lower = q.lower()
+    relevant = []
+    for tab, keywords in TAB_KEYWORDS.items():
+        for kw in keywords:
+            if kw in q_lower or q_lower in kw:
+                if tab not in relevant:
+                    relevant.append(tab)
+                break
+    if not relevant:
+        # default: search most common tabs
+        relevant = ["PVC", "CPVC", "GI & Brass"]
+    if "New Items" not in relevant:
+        relevant.append("New Items")
+    return relevant[:4]  # max 4 tabs per search
 
 class LoginRequest(BaseModel):
     username: str
@@ -54,21 +88,6 @@ class Token(BaseModel):
     access_token: str
     role: str
     username: str
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=["HS256"])
-        return payload
-    except:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-@app.post("/api/login", response_model=Token)
-def login(req: LoginRequest):
-    user = USERS.get(req.username)
-    if not user or user["password"] != req.password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = jwt.encode({"username": req.username, "role": user["role"]}, SECRET_KEY, algorithm="HS256")
-    return {"access_token": token, "role": user["role"], "username": req.username}
 
 class BillItem(BaseModel):
     item_name: str
@@ -120,61 +139,51 @@ def generate_bill_number():
     today = datetime.now()
     prefix = f"SLD{today.strftime('%y%m')}"
     result = supabase.table("bills").select("bill_number").ilike(
-        "bill_number", f"{prefix}%"
-    ).order("bill_number", desc=True).limit(1).execute()
+        "bill_number", f"{prefix}%").order("bill_number", desc=True).limit(1).execute()
     if result.data:
-        last = result.data[0]["bill_number"]
         try:
-            seq = int(last[-4:]) + 1
+            seq = int(result.data[0]["bill_number"][-4:]) + 1
         except:
             seq = 1
     else:
         seq = 1
     return f"{prefix}{seq:04d}"
 
-# ── MAIN TABS (rows start at 4) ──────────────────────
-MAIN_TABS = [
-    "PVC", "CPVC", "UPVC", "SWR Drainage", "GI & Brass",
-    "Motors & Pumps", "Water Tanks", "Sanitary Ware",
-    "Taps & Valves", "Column Pipes", "Solvents", "Miscellaneous"
-]
+@app.post("/api/login", response_model=Token)
+def login(req: LoginRequest):
+    user = USERS.get(req.username)
+    if not user or user["password"] != req.password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = jwt.encode({"username": req.username, "role": user["role"]}, SECRET_KEY, algorithm="HS256")
+    return {"access_token": token, "role": user["role"], "username": req.username}
 
-# ── FIXED SEARCH — ONE batchGet call instead of 13 separate calls ──
 @app.get("/api/products/search")
 def search_products(q: str, user=Depends(verify_token)):
     if not q or len(q) < 2:
         return []
-
     sheets = get_sheets_service()
     q_lower = q.lower()
     results = []
+    tabs_to_search = get_relevant_tabs(q)
 
-    # Build all ranges in ONE request — 1 API call for main tabs
-    ranges = [f"'{tab}'!A4:D500" for tab in MAIN_TABS]
-    ranges.append("'New Items'!A2:D500")  # New Items starts at row 2
-
-    try:
-        resp = sheets.values().batchGet(
-            spreadsheetId=SHEET_ID,
-            ranges=ranges
-        ).execute()
-
-        value_ranges = resp.get("valueRanges", [])
-        all_tabs = MAIN_TABS + ["New Items"]
-
-        for i, vr in enumerate(value_ranges):
-            tab = all_tabs[i] if i < len(all_tabs) else "Unknown"
-            rows = vr.get("values", [])
+    for tab in tabs_to_search:
+        try:
+            start = 2 if tab == "New Items" else 4
+            resp = sheets.values().get(
+                spreadsheetId=SHEET_ID,
+                range=f"'{tab}'!A{start}:D200"  # limit to 200 rows max
+            ).execute()
+            rows = resp.get("values", [])
+            skip = {"—", "", "Item", "item", "Product", "ITEM", "S. No", "S.no"}
             for row in rows:
                 if len(row) >= 2:
-                    item_name = str(row[1]).strip() if len(row) > 1 else ""
+                    item_name = str(row[1]).strip()
                     unit = str(row[2]).strip() if len(row) > 2 else "Per Piece"
                     price_raw = str(row[3]).strip() if len(row) > 3 else "0"
                     try:
                         price = float(price_raw.replace(",", ""))
                     except:
                         price = 0.0
-                    skip = ["—", "", "Item", "item", "Product", "ITEM", "S. No"]
                     if q_lower in item_name.lower() and item_name not in skip:
                         results.append({
                             "item_name": item_name,
@@ -182,25 +191,20 @@ def search_products(q: str, user=Depends(verify_token)):
                             "price": price,
                             "tab": tab
                         })
-    except Exception as e:
-        print(f"BatchGet error: {e}")
-        return []
-
-    return results[:20]
+        except Exception as e:
+            print(f"Search error {tab}: {e}")
+            continue
+    return results[:15]
 
 @app.post("/api/products/new")
 def add_new_item(item: NewItemRequest, user=Depends(verify_token)):
     sheets = get_sheets_service()
     try:
         resp = sheets.values().get(
-            spreadsheetId=SHEET_ID,
-            range="'New Items'!A:D"
-        ).execute()
-        rows = resp.get("values", [])
-        sno = max(len(rows), 1)
+            spreadsheetId=SHEET_ID, range="'New Items'!A:D").execute()
+        sno = max(len(resp.get("values", [])), 1)
         sheets.values().append(
-            spreadsheetId=SHEET_ID,
-            range="'New Items'!A:D",
+            spreadsheetId=SHEET_ID, range="'New Items'!A:D",
             valueInputOption="USER_ENTERED",
             body={"values": [[sno, item.item_name, item.unit, item.price]]}
         ).execute()
@@ -215,24 +219,16 @@ def adjust_prices(req: PriceAdjustRequest, user=Depends(verify_token)):
     sheets = get_sheets_service()
     try:
         resp = sheets.values().get(
-            spreadsheetId=SHEET_ID,
-            range=f"'{req.tab_name}'!A4:D1000"
-        ).execute()
+            spreadsheetId=SHEET_ID, range=f"'{req.tab_name}'!A4:D500").execute()
         rows = resp.get("values", [])
         updates = []
         for i, row in enumerate(rows):
             if len(row) >= 4:
                 try:
-                    old_price = float(str(row[3]).replace(",", "").strip())
-                    if old_price > 0:
-                        if req.adjustment_type == "percentage":
-                            new_price = round(old_price * (1 + req.adjustment_value / 100), 2)
-                        else:
-                            new_price = round(old_price + req.adjustment_value, 2)
-                        updates.append({
-                            "range": f"'{req.tab_name}'!D{i + 4}",
-                            "values": [[new_price]]
-                        })
+                    old = float(str(row[3]).replace(",", "").strip())
+                    if old > 0:
+                        new = round(old * (1 + req.adjustment_value/100), 2) if req.adjustment_type == "percentage" else round(old + req.adjustment_value, 2)
+                        updates.append({"range": f"'{req.tab_name}'!D{i+4}", "values": [[new]]})
                 except:
                     continue
         if updates:
@@ -251,9 +247,8 @@ def create_bill(bill: Bill, user=Depends(verify_token)):
     data = {
         "bill_number": bill_number, "created_at": now,
         "customer_name": bill.customer_name, "customer_phone": bill.customer_phone,
-        "items": [item.dict() for item in bill.items],
-        "subtotal": bill.subtotal, "gst_enabled": bill.gst_enabled,
-        "gst_rate": bill.gst_rate, "gst_amount": bill.gst_amount,
+        "items": [i.dict() for i in bill.items], "subtotal": bill.subtotal,
+        "gst_enabled": bill.gst_enabled, "gst_rate": bill.gst_rate, "gst_amount": bill.gst_amount,
         "discount_enabled": bill.discount_enabled, "discount_amount": bill.discount_amount,
         "advance_amount": bill.advance_amount, "grand_total": bill.grand_total,
         "payment_status": bill.payment_status, "payment_method": bill.payment_method,
@@ -264,13 +259,11 @@ def create_bill(bill: Bill, user=Depends(verify_token)):
     result = supabase.table("bills").insert(data).execute()
     existing = supabase.table("customers").select("*").eq("phone", bill.customer_phone).execute()
     if existing.data:
-        cust = existing.data[0]
+        c = existing.data[0]
         supabase.table("customers").update({
-            "total_purchases": cust["total_purchases"] + bill.grand_total,
-            "outstanding_credit": cust["outstanding_credit"] + (
-                bill.grand_total if bill.payment_status == "credit" else 0),
-            "bill_count": cust["bill_count"] + 1,
-            "last_purchase": now
+            "total_purchases": c["total_purchases"] + bill.grand_total,
+            "outstanding_credit": c["outstanding_credit"] + (bill.grand_total if bill.payment_status == "credit" else 0),
+            "bill_count": c["bill_count"] + 1, "last_purchase": now
         }).eq("phone", bill.customer_phone).execute()
     else:
         supabase.table("customers").insert({
@@ -283,40 +276,29 @@ def create_bill(bill: Bill, user=Depends(verify_token)):
         supabase.table("credit_reminders").insert({
             "bill_id": result.data[0]["id"], "bill_number": bill_number,
             "customer_name": bill.customer_name, "customer_phone": bill.customer_phone,
-            "amount": bill.grand_total, "reminder_count": 0,
-            "status": "active", "created_at": now
+            "amount": bill.grand_total, "reminder_count": 0, "status": "active", "created_at": now
         }).execute()
     return {"bill_number": bill_number, "id": result.data[0]["id"]}
 
 @app.get("/api/bills")
-def get_bills(status: Optional[str] = None, search: Optional[str] = None,
-              from_date: Optional[str] = None, to_date: Optional[str] = None,
-              limit: int = 50, offset: int = 0, user=Depends(verify_token)):
+def get_bills(status: Optional[str]=None, search: Optional[str]=None,
+              from_date: Optional[str]=None, to_date: Optional[str]=None,
+              limit: int=50, offset: int=0, user=Depends(verify_token)):
     query = supabase.table("bills").select("*")
-    if status:
-        query = query.eq("payment_status", status)
-    if search:
-        query = query.or_(
-            f"customer_name.ilike.%{search}%,bill_number.ilike.%{search}%,customer_phone.ilike.%{search}%"
-        )
-    if from_date:
-        query = query.gte("created_at", from_date)
-    if to_date:
-        query = query.lte("created_at", to_date)
-    result = query.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
-    return result.data
+    if status: query = query.eq("payment_status", status)
+    if search: query = query.or_(f"customer_name.ilike.%{search}%,bill_number.ilike.%{search}%,customer_phone.ilike.%{search}%")
+    if from_date: query = query.gte("created_at", from_date)
+    if to_date: query = query.lte("created_at", to_date)
+    return query.order("created_at", desc=True).range(offset, offset+limit-1).execute().data
 
 @app.get("/api/bills/pinned")
 def get_pinned_bills(user=Depends(verify_token)):
-    result = supabase.table("bills").select("*").eq(
-        "is_pinned", True).order("created_at", desc=True).limit(20).execute()
-    return result.data
+    return supabase.table("bills").select("*").eq("is_pinned", True).order("created_at", desc=True).limit(20).execute().data
 
 @app.get("/api/bills/{bill_id}")
 def get_bill(bill_id: str, user=Depends(verify_token)):
     result = supabase.table("bills").select("*").eq("id", bill_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Bill not found")
+    if not result.data: raise HTTPException(status_code=404, detail="Not found")
     return result.data[0]
 
 @app.patch("/api/bills/{bill_id}/pin")
@@ -326,116 +308,96 @@ def toggle_pin(bill_id: str, pinned: bool, user=Depends(verify_token)):
 
 @app.patch("/api/bills/{bill_id}/payment")
 def update_payment(bill_id: str, payment_status: str, payment_method: str,
-                   upi_id: Optional[str] = None, user=Depends(verify_token)):
+                   upi_id: Optional[str]=None, user=Depends(verify_token)):
     supabase.table("bills").update({
         "payment_status": payment_status, "payment_method": payment_method,
         "upi_transaction_id": upi_id,
         "paid_at": datetime.now().isoformat() if payment_status == "paid" else None
     }).eq("id", bill_id).execute()
     if payment_status == "paid":
-        supabase.table("credit_reminders").update(
-            {"status": "stopped"}).eq("bill_id", bill_id).execute()
-    return {"message": "Payment updated"}
+        supabase.table("credit_reminders").update({"status": "stopped"}).eq("bill_id", bill_id).execute()
+    return {"message": "Updated"}
 
 @app.delete("/api/bills/{bill_id}")
 def delete_bill(bill_id: str, user=Depends(verify_token)):
-    if user["role"] != "owner":
-        raise HTTPException(status_code=403, detail="Owner access only")
+    if user["role"] != "owner": raise HTTPException(status_code=403, detail="Owner only")
     supabase.table("bills").delete().eq("id", bill_id).execute()
-    return {"message": "Bill deleted"}
+    return {"message": "Deleted"}
 
 @app.post("/api/bills/{bill_id}/return")
 def create_return(bill_id: str, ret: ReturnBill, user=Depends(verify_token)):
-    original = supabase.table("bills").select("*").eq("id", bill_id).execute()
-    if not original.data:
-        raise HTTPException(status_code=404, detail="Original bill not found")
-    orig = original.data[0]
+    orig_data = supabase.table("bills").select("*").eq("id", bill_id).execute()
+    if not orig_data.data: raise HTTPException(status_code=404, detail="Bill not found")
+    orig = orig_data.data[0]
     now = datetime.now().isoformat()
-    new_final = orig["final_amount"] - ret.return_amount
     supabase.table("return_bills").insert({
         "original_bill_id": bill_id, "bill_number": orig["bill_number"],
         "customer_name": orig["customer_name"], "customer_phone": orig["customer_phone"],
-        "items": [item.dict() for item in ret.items],
+        "items": [i.dict() for i in ret.items],
         "return_amount": ret.return_amount, "reason": ret.reason, "created_at": now
     }).execute()
+    new_final = orig["final_amount"] - ret.return_amount
     supabase.table("bills").update({
         "return_amount": orig.get("return_amount", 0) + ret.return_amount,
         "final_amount": new_final
     }).eq("id", bill_id).execute()
-    return {"message": "Return bill created", "new_final_amount": new_final}
+    return {"message": "Return created", "new_final_amount": new_final}
 
 @app.get("/api/bills/{bill_id}/returns")
 def get_returns(bill_id: str, user=Depends(verify_token)):
-    result = supabase.table("return_bills").select("*").eq(
-        "original_bill_id", bill_id).execute()
-    return result.data
+    return supabase.table("return_bills").select("*").eq("original_bill_id", bill_id).execute().data
 
 @app.get("/api/dashboard")
 def get_dashboard(user=Depends(verify_token)):
     today = date.today().isoformat()
-    today_bills = supabase.table("bills").select("*").gte("created_at", today).execute()
-    today_data = today_bills.data or []
-    credit_bills = supabase.table("bills").select("*").eq("payment_status", "credit").execute()
-    credit_data = credit_bills.data or []
-    pinned = supabase.table("bills").select("*").eq(
-        "is_pinned", True).order("created_at", desc=True).limit(10).execute()
+    today_data = supabase.table("bills").select("*").gte("created_at", today).execute().data or []
+    credit_data = supabase.table("bills").select("*").eq("payment_status", "credit").execute().data or []
+    pinned = supabase.table("bills").select("*").eq("is_pinned", True).order("created_at", desc=True).limit(10).execute().data or []
     return {
         "today_sales": sum(b["grand_total"] for b in today_data),
         "today_bill_count": len(today_data),
         "total_credit_pending": sum(b["final_amount"] for b in credit_data),
         "credit_bill_count": len(credit_data),
-        "pinned_bills": pinned.data or []
+        "pinned_bills": pinned
     }
 
 @app.get("/api/reports/summary")
-def get_report(period: str = "monthly", user=Depends(verify_token)):
-    if user["role"] != "owner":
-        raise HTTPException(status_code=403, detail="Owner access only")
+def get_report(period: str="monthly", user=Depends(verify_token)):
+    if user["role"] != "owner": raise HTTPException(status_code=403, detail="Owner only")
     from datetime import timedelta
     now = datetime.now()
-    if period == "daily":
-        start = now.replace(hour=0, minute=0, second=0).isoformat()
-    elif period == "weekly":
-        start = (now - timedelta(days=7)).isoformat()
-    else:
-        start = now.replace(day=1, hour=0, minute=0, second=0).isoformat()
-    bills = supabase.table("bills").select("*").gte("created_at", start).execute()
-    data = bills.data or []
+    start = now.replace(hour=0,minute=0,second=0).isoformat() if period=="daily" else \
+            (now - timedelta(days=7)).isoformat() if period=="weekly" else \
+            now.replace(day=1,hour=0,minute=0,second=0).isoformat()
+    data = supabase.table("bills").select("*").gte("created_at", start).execute().data or []
     item_sales = {}
     for bill in data:
         for item in bill.get("items", []):
-            name = item["item_name"]
-            item_sales[name] = item_sales.get(name, 0) + item["amount"]
-    top_items = sorted(item_sales.items(), key=lambda x: x[1], reverse=True)[:10]
+            item_sales[item["item_name"]] = item_sales.get(item["item_name"], 0) + item["amount"]
+    top = sorted(item_sales.items(), key=lambda x: x[1], reverse=True)[:10]
     return {
         "period": period,
         "total_revenue": sum(b["grand_total"] for b in data),
         "total_gst_collected": sum(b.get("gst_amount", 0) for b in data),
         "bill_count": len(data),
-        "paid_count": len([b for b in data if b["payment_status"] == "paid"]),
-        "credit_count": len([b for b in data if b["payment_status"] == "credit"]),
-        "top_items": [{"name": k, "amount": v} for k, v in top_items]
+        "paid_count": len([b for b in data if b["payment_status"]=="paid"]),
+        "credit_count": len([b for b in data if b["payment_status"]=="credit"]),
+        "top_items": [{"name": k, "amount": v} for k, v in top]
     }
 
 @app.get("/api/customers")
-def get_customers(search: Optional[str] = None, user=Depends(verify_token)):
+def get_customers(search: Optional[str]=None, user=Depends(verify_token)):
     query = supabase.table("customers").select("*")
-    if search:
-        query = query.or_(f"name.ilike.%{search}%,phone.ilike.%{search}%")
-    result = query.order("last_purchase", desc=True).execute()
-    return result.data
+    if search: query = query.or_(f"name.ilike.%{search}%,phone.ilike.%{search}%")
+    return query.order("last_purchase", desc=True).execute().data
 
 @app.get("/api/customers/{phone}/bills")
 def get_customer_bills(phone: str, user=Depends(verify_token)):
-    result = supabase.table("bills").select("*").eq(
-        "customer_phone", phone).order("created_at", desc=True).execute()
-    return result.data
+    return supabase.table("bills").select("*").eq("customer_phone", phone).order("created_at", desc=True).execute().data
 
 @app.get("/api/credit-reminders")
 def get_reminders(user=Depends(verify_token)):
-    result = supabase.table("credit_reminders").select("*").eq(
-        "status", "active").order("created_at", desc=True).execute()
-    return result.data
+    return supabase.table("credit_reminders").select("*").eq("status", "active").order("created_at", desc=True).execute().data
 
 @app.get("/api/health")
 def health():
