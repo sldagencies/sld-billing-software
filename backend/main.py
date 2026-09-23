@@ -57,14 +57,32 @@ ALL_TABS = [
 ]
 
 def normalize(text: str) -> str:
-    """Remove quotes, dots, extra spaces for fuzzy matching.
-    '3" PVC Pipe 4kg' → '3 pvc pipe 4kg'
-    So user can type '3 pvc pipe' and still find it."""
+    """Remove quotes so 3" PVC becomes 3 pvc"""
+    import re as _re
     text = text.lower()
-    text = text.replace('"', ' ').replace("'", ' ').replace('\u201c', ' ').replace('\u201d', ' ')
-    text = text.replace('/', ' ').replace('\\', ' ').replace('.', ' ')
-    text = re.sub(r'\s+', ' ', text).strip()
+    text = _re.sub(r'["“”/\\]', ' ', text)
+    text = _re.sub(r"'", ' ', text)
+    text = _re.sub(r'\s+', ' ', text).strip()
     return text
+
+def score_match(item_key: str, search_words: list) -> int:
+    """Word-boundary scoring: 4 pvc excludes 5 pvc pipe 4kg"""
+    item_words = item_key.split()
+    score = 0
+    for sw in search_words:
+        found = False
+        for iw in item_words:
+            if sw == iw:
+                score += 10; found = True; break
+            elif (not sw.replace('.','').isdigit()) and iw.startswith(sw) and len(sw) >= 2:
+                score += 3; found = True; break
+        if not found:
+            if (not sw.replace('.','').isdigit()) and sw in item_key:
+                score += 1
+            else:
+                return -1
+    return score
+
 
 # Cache: load all products once into memory
 _product_cache = []
@@ -198,7 +216,7 @@ def login(req: LoginRequest):
     )
     return {"access_token": token, "role": user["role"], "username": req.username}
 
-# ── SEARCH — keyword search, shows ALL related products ──
+# ── SEARCH — word-boundary matching, numbers must be exact ──
 @app.get("/api/products/search")
 def search_products(q: str, user=Depends(verify_token)):
     if not q or len(q) < 1:
@@ -208,18 +226,13 @@ def search_products(q: str, user=Depends(verify_token)):
     words = [w for w in q_norm.split() if len(w) >= 1]
     if not words:
         return []
-
-    def score(p):
-        key = p["search_key"]
-        # Count how many search words match
-        matched = sum(1 for w in words if w in key)
-        return matched
-
-    # Include product if AT LEAST ONE word matches
-    results = [(score(p), p) for p in products if score(p) > 0]
-    # Sort by score descending (most matching words first)
-    results.sort(key=lambda x: x[0], reverse=True)
-    return [p for _, p in results[:25]]
+    scored = []
+    for p in products:
+        s = score_match(p["search_key"], words)
+        if s > 0:
+            scored.append((s, p))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored[:25]]
 
 # ── RELOAD CACHE (call after price updates) ──
 @app.post("/api/products/reload-cache")
