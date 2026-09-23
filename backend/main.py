@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
+import re
 import os
 from supabase import create_client, Client
 from google.oauth2 import service_account
@@ -55,7 +56,17 @@ ALL_TABS = [
     ("Solvents", 4), ("Miscellaneous", 4), ("New Items", 2),
 ]
 
-# Cache: load all products once and keep in memory
+def normalize(text: str) -> str:
+    """Remove quotes, dots, extra spaces for fuzzy matching.
+    '3" PVC Pipe 4kg' → '3 pvc pipe 4kg'
+    So user can type '3 pvc pipe' and still find it."""
+    text = text.lower()
+    text = text.replace('"', ' ').replace("'", ' ').replace('\u201c', ' ').replace('\u201d', ' ')
+    text = text.replace('/', ' ').replace('\\', ' ').replace('.', ' ')
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+# Cache: load all products once into memory
 _product_cache = []
 _cache_loaded = False
 
@@ -65,8 +76,7 @@ def load_all_products():
         return _product_cache
 
     sheets = get_sheets_service()
-    # ONE single batchGet call for ALL tabs — very efficient
-    ranges = [f"'{tab}'!B{start}:D100" for tab, start in ALL_TABS]
+    ranges = [f"'{tab}'!B{start}:D200" for tab, start in ALL_TABS]
     try:
         resp = sheets.values().batchGet(
             spreadsheetId=SHEET_ID,
@@ -74,7 +84,7 @@ def load_all_products():
         ).execute()
         value_ranges = resp.get("valueRanges", [])
         products = []
-        skip = {"—", "", "Item", "item", "Product", "ITEM", "S. No", "S.no"}
+        skip = {"—", "", "item", "product", "s. no", "s.no"}
         for i, vr in enumerate(value_ranges):
             tab = ALL_TABS[i][0]
             rows = vr.get("values", [])
@@ -83,7 +93,7 @@ def load_all_products():
                 item_name = str(row[0]).strip() if len(row) > 0 else ""
                 unit = str(row[1]).strip() if len(row) > 1 else "Per Piece"
                 price_raw = str(row[2]).strip() if len(row) > 2 else "0"
-                if not item_name or item_name in skip:
+                if not item_name or item_name.lower() in skip:
                     continue
                 try:
                     price = float(price_raw.replace(",", ""))
@@ -94,14 +104,14 @@ def load_all_products():
                     "unit": unit,
                     "price": price,
                     "tab": tab,
-                    "search_key": item_name.lower()
+                    "search_key": normalize(item_name)  # normalized for fuzzy search
                 })
         _product_cache = products
         _cache_loaded = True
-        print(f"Cache loaded: {len(products)} products")
+        print(f"✅ Cache loaded: {len(products)} products")
         return products
     except Exception as e:
-        print(f"Cache load error: {e}")
+        print(f"❌ Cache load error: {e}")
         return []
 
 def invalidate_cache():
@@ -188,14 +198,21 @@ def login(req: LoginRequest):
     )
     return {"access_token": token, "role": user["role"], "username": req.username}
 
-# ── SEARCH — uses in-memory cache, searches ALL tabs ──
+# ── SEARCH — fuzzy word match, works without " or special chars ──
 @app.get("/api/products/search")
 def search_products(q: str, user=Depends(verify_token)):
     if not q or len(q) < 1:
         return []
     products = load_all_products()
-    q_lower = q.lower()
-    results = [p for p in products if q_lower in p["search_key"]]
+    q_norm = normalize(q)
+    words = q_norm.split()
+    if not words:
+        return []
+    # All words must appear in the item's normalized search_key
+    results = [
+        p for p in products
+        if all(w in p["search_key"] for w in words)
+    ]
     return results[:20]
 
 # ── RELOAD CACHE (call after price updates) ──
