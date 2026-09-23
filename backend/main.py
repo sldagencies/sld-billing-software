@@ -198,22 +198,28 @@ def login(req: LoginRequest):
     )
     return {"access_token": token, "role": user["role"], "username": req.username}
 
-# ── SEARCH — fuzzy word match, works without " or special chars ──
+# ── SEARCH — keyword search, shows ALL related products ──
 @app.get("/api/products/search")
 def search_products(q: str, user=Depends(verify_token)):
     if not q or len(q) < 1:
         return []
     products = load_all_products()
     q_norm = normalize(q)
-    words = q_norm.split()
+    words = [w for w in q_norm.split() if len(w) >= 1]
     if not words:
         return []
-    # All words must appear in the item's normalized search_key
-    results = [
-        p for p in products
-        if all(w in p["search_key"] for w in words)
-    ]
-    return results[:20]
+
+    def score(p):
+        key = p["search_key"]
+        # Count how many search words match
+        matched = sum(1 for w in words if w in key)
+        return matched
+
+    # Include product if AT LEAST ONE word matches
+    results = [(score(p), p) for p in products if score(p) > 0]
+    # Sort by score descending (most matching words first)
+    results.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in results[:25]]
 
 # ── RELOAD CACHE (call after price updates) ──
 @app.post("/api/products/reload-cache")
