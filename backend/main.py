@@ -47,38 +47,66 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     except:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# ── Smart tab detection — searches only relevant tabs ──
-TAB_KEYWORDS = {
-    "PVC":           ["pvc", "agri", "agriculture", "saddle", "reducer", "plug", "repair coupler"],
-    "CPVC":          ["cpvc", "concealed", "wall mixture"],
-    "UPVC":          ["upvc"],
-    "SWR Drainage":  ["swr", "drain", "asaid", "nahan", "multi trap", "door elbow", "door tee"],
-    "GI & Brass":    ["gi pipe", "galvanised", "gi elbow", "gi tee", "gi coupler", "gi union",
-                      "brass ball", "brass nrv", "hose bend", "hose nipple", "check valve", "brass"],
-    "Motors & Pumps":["motor", "pump", "hp cri", "cri", "monoblock", "submersible", "bore", "agri pump"],
-    "Water Tanks":   ["tank", "plasto", "truflo", "ruf", "foam", "nandi", "litre", "lit"],
-    "Sanitary Ware": ["basin", "western", "indian", "flush", "wash basin", "pedestal", "commode"],
-    "Taps & Valves": ["tap", "valve", "cock", "gate", "stop cock", "angle", "pillar", "bib"],
-    "Column Pipes":  ["column pipe", "column"],
-    "Solvents":      ["solvent", "ptfe", "tape", "sealant", "silicone", "epoxy", "cement"],
-    "Miscellaneous": [],
-}
+# All tabs with their start rows
+ALL_TABS = [
+    ("PVC", 4), ("CPVC", 4), ("UPVC", 4), ("SWR Drainage", 4),
+    ("GI & Brass", 4), ("Motors & Pumps", 4), ("Water Tanks", 4),
+    ("Sanitary Ware", 4), ("Taps & Valves", 4), ("Column Pipes", 4),
+    ("Solvents", 4), ("Miscellaneous", 4), ("New Items", 2),
+]
 
-def get_relevant_tabs(q: str) -> List[str]:
-    q_lower = q.lower()
-    relevant = []
-    for tab, keywords in TAB_KEYWORDS.items():
-        for kw in keywords:
-            if kw in q_lower or q_lower in kw:
-                if tab not in relevant:
-                    relevant.append(tab)
-                break
-    if not relevant:
-        # default: search most common tabs
-        relevant = ["PVC", "CPVC", "GI & Brass"]
-    if "New Items" not in relevant:
-        relevant.append("New Items")
-    return relevant[:4]  # max 4 tabs per search
+# Cache: load all products once and keep in memory
+_product_cache = []
+_cache_loaded = False
+
+def load_all_products():
+    global _product_cache, _cache_loaded
+    if _cache_loaded:
+        return _product_cache
+
+    sheets = get_sheets_service()
+    # ONE single batchGet call for ALL tabs — very efficient
+    ranges = [f"'{tab}'!B{start}:D100" for tab, start in ALL_TABS]
+    try:
+        resp = sheets.values().batchGet(
+            spreadsheetId=SHEET_ID,
+            ranges=ranges
+        ).execute()
+        value_ranges = resp.get("valueRanges", [])
+        products = []
+        skip = {"—", "", "Item", "item", "Product", "ITEM", "S. No", "S.no"}
+        for i, vr in enumerate(value_ranges):
+            tab = ALL_TABS[i][0]
+            rows = vr.get("values", [])
+            for row in rows:
+                if not row: continue
+                item_name = str(row[0]).strip() if len(row) > 0 else ""
+                unit = str(row[1]).strip() if len(row) > 1 else "Per Piece"
+                price_raw = str(row[2]).strip() if len(row) > 2 else "0"
+                if not item_name or item_name in skip:
+                    continue
+                try:
+                    price = float(price_raw.replace(",", ""))
+                except:
+                    price = 0.0
+                products.append({
+                    "item_name": item_name,
+                    "unit": unit,
+                    "price": price,
+                    "tab": tab,
+                    "search_key": item_name.lower()
+                })
+        _product_cache = products
+        _cache_loaded = True
+        print(f"Cache loaded: {len(products)} products")
+        return products
+    except Exception as e:
+        print(f"Cache load error: {e}")
+        return []
+
+def invalidate_cache():
+    global _cache_loaded
+    _cache_loaded = False
 
 class LoginRequest(BaseModel):
     username: str
@@ -154,47 +182,28 @@ def login(req: LoginRequest):
     user = USERS.get(req.username)
     if not user or user["password"] != req.password:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = jwt.encode({"username": req.username, "role": user["role"]}, SECRET_KEY, algorithm="HS256")
+    token = jwt.encode(
+        {"username": req.username, "role": user["role"]},
+        SECRET_KEY, algorithm="HS256"
+    )
     return {"access_token": token, "role": user["role"], "username": req.username}
 
+# ── SEARCH — uses in-memory cache, searches ALL tabs ──
 @app.get("/api/products/search")
 def search_products(q: str, user=Depends(verify_token)):
-    if not q or len(q) < 2:
+    if not q or len(q) < 1:
         return []
-    sheets = get_sheets_service()
+    products = load_all_products()
     q_lower = q.lower()
-    results = []
-    tabs_to_search = get_relevant_tabs(q)
+    results = [p for p in products if q_lower in p["search_key"]]
+    return results[:20]
 
-    for tab in tabs_to_search:
-        try:
-            start = 2 if tab == "New Items" else 4
-            resp = sheets.values().get(
-                spreadsheetId=SHEET_ID,
-                range=f"'{tab}'!A{start}:D200"  # limit to 200 rows max
-            ).execute()
-            rows = resp.get("values", [])
-            skip = {"—", "", "Item", "item", "Product", "ITEM", "S. No", "S.no"}
-            for row in rows:
-                if len(row) >= 2:
-                    item_name = str(row[1]).strip()
-                    unit = str(row[2]).strip() if len(row) > 2 else "Per Piece"
-                    price_raw = str(row[3]).strip() if len(row) > 3 else "0"
-                    try:
-                        price = float(price_raw.replace(",", ""))
-                    except:
-                        price = 0.0
-                    if q_lower in item_name.lower() and item_name not in skip:
-                        results.append({
-                            "item_name": item_name,
-                            "unit": unit,
-                            "price": price,
-                            "tab": tab
-                        })
-        except Exception as e:
-            print(f"Search error {tab}: {e}")
-            continue
-    return results[:15]
+# ── RELOAD CACHE (call after price updates) ──
+@app.post("/api/products/reload-cache")
+def reload_cache(user=Depends(verify_token)):
+    invalidate_cache()
+    products = load_all_products()
+    return {"message": f"Cache reloaded with {len(products)} products"}
 
 @app.post("/api/products/new")
 def add_new_item(item: NewItemRequest, user=Depends(verify_token)):
@@ -208,7 +217,8 @@ def add_new_item(item: NewItemRequest, user=Depends(verify_token)):
             valueInputOption="USER_ENTERED",
             body={"values": [[sno, item.item_name, item.unit, item.price]]}
         ).execute()
-        return {"message": f"'{item.item_name}' added to New Items tab"}
+        invalidate_cache()  # refresh cache
+        return {"message": f"'{item.item_name}' added successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -219,7 +229,9 @@ def adjust_prices(req: PriceAdjustRequest, user=Depends(verify_token)):
     sheets = get_sheets_service()
     try:
         resp = sheets.values().get(
-            spreadsheetId=SHEET_ID, range=f"'{req.tab_name}'!A4:D500").execute()
+            spreadsheetId=SHEET_ID,
+            range=f"'{req.tab_name}'!A4:D500"
+        ).execute()
         rows = resp.get("values", [])
         updates = []
         for i, row in enumerate(rows):
@@ -227,8 +239,13 @@ def adjust_prices(req: PriceAdjustRequest, user=Depends(verify_token)):
                 try:
                     old = float(str(row[3]).replace(",", "").strip())
                     if old > 0:
-                        new = round(old * (1 + req.adjustment_value/100), 2) if req.adjustment_type == "percentage" else round(old + req.adjustment_value, 2)
-                        updates.append({"range": f"'{req.tab_name}'!D{i+4}", "values": [[new]]})
+                        new = round(old * (1 + req.adjustment_value/100), 2) \
+                            if req.adjustment_type == "percentage" \
+                            else round(old + req.adjustment_value, 2)
+                        updates.append({
+                            "range": f"'{req.tab_name}'!D{i+4}",
+                            "values": [[new]]
+                        })
                 except:
                     continue
         if updates:
@@ -236,6 +253,7 @@ def adjust_prices(req: PriceAdjustRequest, user=Depends(verify_token)):
                 spreadsheetId=SHEET_ID,
                 body={"valueInputOption": "USER_ENTERED", "data": updates}
             ).execute()
+        invalidate_cache()
         return {"message": f"Updated {len(updates)} prices in {req.tab_name}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -248,21 +266,24 @@ def create_bill(bill: Bill, user=Depends(verify_token)):
         "bill_number": bill_number, "created_at": now,
         "customer_name": bill.customer_name, "customer_phone": bill.customer_phone,
         "items": [i.dict() for i in bill.items], "subtotal": bill.subtotal,
-        "gst_enabled": bill.gst_enabled, "gst_rate": bill.gst_rate, "gst_amount": bill.gst_amount,
-        "discount_enabled": bill.discount_enabled, "discount_amount": bill.discount_amount,
-        "advance_amount": bill.advance_amount, "grand_total": bill.grand_total,
-        "payment_status": bill.payment_status, "payment_method": bill.payment_method,
+        "gst_enabled": bill.gst_enabled, "gst_rate": bill.gst_rate,
+        "gst_amount": bill.gst_amount, "discount_enabled": bill.discount_enabled,
+        "discount_amount": bill.discount_amount, "advance_amount": bill.advance_amount,
+        "grand_total": bill.grand_total, "payment_status": bill.payment_status,
+        "payment_method": bill.payment_method,
         "upi_transaction_id": bill.upi_transaction_id, "notes": bill.notes,
         "created_by": user["username"], "is_pinned": True,
         "return_amount": 0.0, "final_amount": bill.grand_total
     }
     result = supabase.table("bills").insert(data).execute()
-    existing = supabase.table("customers").select("*").eq("phone", bill.customer_phone).execute()
+    existing = supabase.table("customers").select("*").eq(
+        "phone", bill.customer_phone).execute()
     if existing.data:
         c = existing.data[0]
         supabase.table("customers").update({
             "total_purchases": c["total_purchases"] + bill.grand_total,
-            "outstanding_credit": c["outstanding_credit"] + (bill.grand_total if bill.payment_status == "credit" else 0),
+            "outstanding_credit": c["outstanding_credit"] + (
+                bill.grand_total if bill.payment_status == "credit" else 0),
             "bill_count": c["bill_count"] + 1, "last_purchase": now
         }).eq("phone", bill.customer_phone).execute()
     else:
@@ -276,7 +297,8 @@ def create_bill(bill: Bill, user=Depends(verify_token)):
         supabase.table("credit_reminders").insert({
             "bill_id": result.data[0]["id"], "bill_number": bill_number,
             "customer_name": bill.customer_name, "customer_phone": bill.customer_phone,
-            "amount": bill.grand_total, "reminder_count": 0, "status": "active", "created_at": now
+            "amount": bill.grand_total, "reminder_count": 0,
+            "status": "active", "created_at": now
         }).execute()
     return {"bill_number": bill_number, "id": result.data[0]["id"]}
 
@@ -293,7 +315,8 @@ def get_bills(status: Optional[str]=None, search: Optional[str]=None,
 
 @app.get("/api/bills/pinned")
 def get_pinned_bills(user=Depends(verify_token)):
-    return supabase.table("bills").select("*").eq("is_pinned", True).order("created_at", desc=True).limit(20).execute().data
+    return supabase.table("bills").select("*").eq(
+        "is_pinned", True).order("created_at", desc=True).limit(20).execute().data
 
 @app.get("/api/bills/{bill_id}")
 def get_bill(bill_id: str, user=Depends(verify_token)):
@@ -315,7 +338,8 @@ def update_payment(bill_id: str, payment_status: str, payment_method: str,
         "paid_at": datetime.now().isoformat() if payment_status == "paid" else None
     }).eq("id", bill_id).execute()
     if payment_status == "paid":
-        supabase.table("credit_reminders").update({"status": "stopped"}).eq("bill_id", bill_id).execute()
+        supabase.table("credit_reminders").update(
+            {"status": "stopped"}).eq("bill_id", bill_id).execute()
     return {"message": "Updated"}
 
 @app.delete("/api/bills/{bill_id}")
@@ -345,14 +369,18 @@ def create_return(bill_id: str, ret: ReturnBill, user=Depends(verify_token)):
 
 @app.get("/api/bills/{bill_id}/returns")
 def get_returns(bill_id: str, user=Depends(verify_token)):
-    return supabase.table("return_bills").select("*").eq("original_bill_id", bill_id).execute().data
+    return supabase.table("return_bills").select("*").eq(
+        "original_bill_id", bill_id).execute().data
 
 @app.get("/api/dashboard")
 def get_dashboard(user=Depends(verify_token)):
     today = date.today().isoformat()
-    today_data = supabase.table("bills").select("*").gte("created_at", today).execute().data or []
-    credit_data = supabase.table("bills").select("*").eq("payment_status", "credit").execute().data or []
-    pinned = supabase.table("bills").select("*").eq("is_pinned", True).order("created_at", desc=True).limit(10).execute().data or []
+    today_data = supabase.table("bills").select("*").gte(
+        "created_at", today).execute().data or []
+    credit_data = supabase.table("bills").select("*").eq(
+        "payment_status", "credit").execute().data or []
+    pinned = supabase.table("bills").select("*").eq(
+        "is_pinned", True).order("created_at", desc=True).limit(10).execute().data or []
     return {
         "today_sales": sum(b["grand_total"] for b in today_data),
         "today_bill_count": len(today_data),
@@ -363,11 +391,12 @@ def get_dashboard(user=Depends(verify_token)):
 
 @app.get("/api/reports/summary")
 def get_report(period: str="monthly", user=Depends(verify_token)):
-    if user["role"] != "owner": raise HTTPException(status_code=403, detail="Owner only")
+    if user["role"] != "owner":
+        raise HTTPException(status_code=403, detail="Owner only")
     from datetime import timedelta
     now = datetime.now()
     start = now.replace(hour=0,minute=0,second=0).isoformat() if period=="daily" else \
-            (now - timedelta(days=7)).isoformat() if period=="weekly" else \
+            (now-timedelta(days=7)).isoformat() if period=="weekly" else \
             now.replace(day=1,hour=0,minute=0,second=0).isoformat()
     data = supabase.table("bills").select("*").gte("created_at", start).execute().data or []
     item_sales = {}
@@ -393,11 +422,13 @@ def get_customers(search: Optional[str]=None, user=Depends(verify_token)):
 
 @app.get("/api/customers/{phone}/bills")
 def get_customer_bills(phone: str, user=Depends(verify_token)):
-    return supabase.table("bills").select("*").eq("customer_phone", phone).order("created_at", desc=True).execute().data
+    return supabase.table("bills").select("*").eq(
+        "customer_phone", phone).order("created_at", desc=True).execute().data
 
 @app.get("/api/credit-reminders")
 def get_reminders(user=Depends(verify_token)):
-    return supabase.table("credit_reminders").select("*").eq("status", "active").order("created_at", desc=True).execute().data
+    return supabase.table("credit_reminders").select("*").eq(
+        "status", "active").order("created_at", desc=True).execute().data
 
 @app.get("/api/health")
 def health():
