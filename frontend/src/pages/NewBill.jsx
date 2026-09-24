@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { searchProducts, createBill, addNewItem, formatINR } from "../api";
 import BillPrint from "../components/BillPrint";
 
-const EMPTY_ITEM = { item_name: "", unit: "", qty: 1, rate: 0, amount: 0 };
+const EMPTY_ITEM = { item_name: "", unit: "", qty: "", rate: 0, amount: 0 };
 
 export default function NewBill({ token }) {
   const [customer, setCustomer] = useState({ name: "", phone: "" });
@@ -16,7 +16,6 @@ export default function NewBill({ token }) {
   const [payMethod, setPayMethod] = useState("cash");
   const [searchResults, setSearchResults] = useState([]);
   const [searchIdx, setSearchIdx] = useState(null);
-  const [dropdownPos, setDropdownPos] = useState({ top: 0, left: 0, width: 0 });
   const [editingRate, setEditingRate] = useState(null);
   const [saving, setSaving] = useState(false);
   const [savedBill, setSavedBill] = useState(null);
@@ -24,8 +23,10 @@ export default function NewBill({ token }) {
   const [showNewItemModal, setShowNewItemModal] = useState(false);
   const [newItemData, setNewItemData] = useState({ item_name: "", unit: "Per Piece", price: "" });
   const [msg, setMsg] = useState("");
-  const inputRefs = useRef({});
   const debounceRef = useRef(null);
+  const searchInputRefs = useRef({});
+  const qtyInputRefs = useRef({});
+  const [dropdownPos, setDropdownPos] = useState({ top: 0, left: 0, width: 0 });
 
   const subtotal = items.reduce((s, i) => s + (parseFloat(i.amount) || 0), 0);
   const gstAmount = gstEnabled ? (subtotal * gstRate) / 100 : 0;
@@ -46,28 +47,34 @@ export default function NewBill({ token }) {
     });
   };
 
-  const handleSearch = useCallback((idx, q, inputEl) => {
+  const handleSearch = useCallback((idx, q) => {
     updateItem(idx, "item_name", q);
     setSearchIdx(idx);
     clearTimeout(debounceRef.current);
+    if (!q || q.length < 1) { setSearchResults([]); return; }
 
-    // Calculate dropdown position from input element
+    // Calculate dropdown position based on input element
+    const inputEl = searchInputRefs.current[idx];
     if (inputEl) {
       const rect = inputEl.getBoundingClientRect();
-      setDropdownPos({
-        top: rect.bottom + window.scrollY + 2,
-        left: rect.left + window.scrollX,
-        width: rect.width + 200
-      });
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const spaceAbove = rect.top;
+      const dropH = 320;
+      if (spaceBelow < dropH && spaceAbove > dropH) {
+        // open upward
+        setDropdownPos({ bottom: window.innerHeight - rect.top + 2, top: "auto", left: rect.left, width: rect.width });
+      } else {
+        // open downward
+        setDropdownPos({ top: rect.bottom + 2, bottom: "auto", left: rect.left, width: rect.width });
+      }
     }
 
-    if (q.length < 1) { setSearchResults([]); return; }
     debounceRef.current = setTimeout(async () => {
       try {
         const res = await searchProducts(q, token);
         setSearchResults(res);
       } catch { setSearchResults([]); }
-    }, 250);
+    }, 200);
   }, [token]);
 
   const selectProduct = (idx, product) => {
@@ -78,16 +85,17 @@ export default function NewBill({ token }) {
         item_name: product.item_name,
         unit: product.unit,
         rate: product.price,
-        amount: parseFloat((updated[idx].qty * product.price).toFixed(2))
+        qty: "",
+        amount: 0
       };
       return updated;
     });
     setSearchResults([]);
     setSearchIdx(null);
-    // Focus qty input of same row after selecting
+    // Focus qty input after selecting item
     setTimeout(() => {
-      const qtyInput = document.getElementById(`qty-${idx}`);
-      if (qtyInput) qtyInput.focus();
+      const qtyEl = qtyInputRefs.current[idx];
+      if (qtyEl) { qtyEl.focus(); qtyEl.select(); }
     }, 50);
   };
 
@@ -96,37 +104,26 @@ export default function NewBill({ token }) {
     // Focus new search input after adding row
     setTimeout(() => {
       const newIdx = items.length;
-      const el = inputRefs.current[newIdx];
+      const el = searchInputRefs.current[newIdx];
       if (el) el.focus();
-    }, 80);
+    }, 60);
   };
 
   const removeRow = (idx) => {
     if (items.length > 1) setItems(prev => prev.filter((_, i) => i !== idx));
   };
 
-  const handleKeyDown = (e, idx) => {
-    if (e.key === "Escape") { setSearchResults([]); setSearchIdx(null); }
-    // Enter: if dropdown open, do nothing (user selects from list)
-    // Enter: if dropdown closed, move to qty field
-    if (e.key === "Enter" && searchResults.length === 0) {
-      e.preventDefault();
-      const qtyEl = document.getElementById(`qty-${idx}`);
-      if (qtyEl) qtyEl.focus();
-    }
-  };
-
+  // Enter on search input → handled by selectProduct (focus qty)
+  // Enter on qty input → add new row and focus its search box
   const handleQtyKeyDown = (e, idx) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      // Move to next row's search input, or add new row
-      const nextEl = inputRefs.current[idx + 1];
-      if (nextEl) {
-        nextEl.focus();
-      } else {
-        addRow();
-      }
+      addRow();
     }
+  };
+
+  const handleSearchKeyDown = (e, idx) => {
+    if (e.key === "Escape") { setSearchResults([]); setSearchIdx(null); }
   };
 
   const handleSave = async () => {
@@ -146,8 +143,9 @@ export default function NewBill({ token }) {
       setSavedBill({ ...bill, bill_number: result.bill_number, id: result.id, created_at: new Date().toISOString() });
       setMsg(`Bill ${result.bill_number} saved successfully!`);
       setShowPrint(true);
-    } catch (e) { setMsg(`Error: ${e.message}`); }
-    finally { setSaving(false); }
+    } catch (e) {
+      setMsg(`Error: ${e.message}`);
+    } finally { setSaving(false); }
   };
 
   const handleNewBill = () => {
@@ -157,7 +155,6 @@ export default function NewBill({ token }) {
     setDiscountAmt(0); setAdvanceAmt(0);
     setPayStatus("credit"); setPayMethod("cash");
     setSavedBill(null); setShowPrint(false); setMsg("");
-    setTimeout(() => { const el = document.getElementById("cust-name"); if (el) el.focus(); }, 50);
   };
 
   const handleAddNewItem = async () => {
@@ -189,7 +186,51 @@ export default function NewBill({ token }) {
   );
 
   return (
-    <div style={{ position: "relative" }}>
+    <div>
+      {/* Fixed dropdown — renders outside table so never clipped */}
+      {searchIdx !== null && searchResults.length > 0 && (
+        <div style={{
+          position: "fixed",
+          top: dropdownPos.top !== "auto" ? dropdownPos.top : "auto",
+          bottom: dropdownPos.bottom !== "auto" ? dropdownPos.bottom : "auto",
+          left: dropdownPos.left,
+          width: dropdownPos.width,
+          background: "#fff",
+          border: "2px solid #1A4480",
+          borderRadius: 10,
+          zIndex: 99999,
+          maxHeight: 320,
+          overflowY: "auto",
+          boxShadow: "0 12px 40px rgba(0,0,0,0.2)"
+        }}>
+          {searchResults.map((r, ri) => (
+            <div key={ri}
+              onMouseDown={() => selectProduct(searchIdx, r)}
+              style={{
+                padding: "11px 16px", cursor: "pointer",
+                borderBottom: "1px solid #f1f5f9",
+                display: "flex", justifyContent: "space-between", alignItems: "center",
+                background: "#fff"
+              }}
+              onMouseEnter={e => e.currentTarget.style.background = "#eff6ff"}
+              onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
+              <div>
+                <div style={{ fontWeight: 600, fontSize: 14, color: "#0B1F3A" }}>{r.item_name}</div>
+                <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>{r.tab} &bull; {r.unit}</div>
+              </div>
+              <div style={{ fontWeight: 800, color: r.price > 0 ? "#1A4480" : "#94a3b8", fontSize: 14, flexShrink: 0, marginLeft: 16 }}>
+                {r.price > 0 ? `Rs.${formatINR(r.price)}` : "No price"}
+              </div>
+            </div>
+          ))}
+          <div
+            onMouseDown={() => { setNewItemData(p => ({ ...p, item_name: items[searchIdx]?.item_name || "" })); setShowNewItemModal(true); setSearchResults([]); }}
+            style={{ padding: "10px 16px", cursor: "pointer", background: "#fffbeb", color: "#92400e", fontWeight: 600, fontSize: 12, borderTop: "2px solid #fde68a" }}>
+            + Not found? Add to price list
+          </div>
+        </div>
+      )}
+
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
         <h1 style={{ fontSize: 22, fontWeight: 800, color: "#0B1F3A", margin: 0 }}>New Bill</h1>
         <button onClick={() => setShowNewItemModal(true)}
@@ -204,142 +245,92 @@ export default function NewBill({ token }) {
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
           <div>
             <label style={{ fontSize: 12, fontWeight: 600, color: "#374151", display: "block", marginBottom: 5 }}>Customer Name (Sri / M/s)</label>
-            <input id="cust-name" value={customer.name} onChange={e => setCustomer(p => ({ ...p, name: e.target.value }))}
-              placeholder="Enter customer name" style={inp}
-              onKeyDown={e => e.key === "Enter" && document.getElementById("cust-phone")?.focus()} />
+            <input value={customer.name} onChange={e => setCustomer(p => ({ ...p, name: e.target.value }))} placeholder="Enter customer name" style={inp} />
           </div>
           <div>
             <label style={{ fontSize: 12, fontWeight: 600, color: "#374151", display: "block", marginBottom: 5 }}>Phone Number</label>
-            <input id="cust-phone" value={customer.phone} onChange={e => setCustomer(p => ({ ...p, phone: e.target.value }))}
-              placeholder="Enter phone number" style={inp}
-              onKeyDown={e => e.key === "Enter" && inputRefs.current[0]?.focus()} />
+            <input value={customer.phone} onChange={e => setCustomer(p => ({ ...p, phone: e.target.value }))} placeholder="Enter phone number" style={inp} />
           </div>
         </div>
       </div>
 
-      {/* Items Table */}
+      {/* Items */}
       <div style={{ background: "#fff", borderRadius: 14, padding: 20, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.06)" }}>
         <h3 style={{ margin: "0 0 14px", color: "#0B1F3A", fontSize: 15, fontWeight: 700 }}>Items</h3>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
-          <thead>
-            <tr style={{ background: "#1A4480", color: "#fff" }}>
-              {["S.No", "Item Name", "Unit", "Qty", "Rate (Rs.)", "Edit Rate", "Amount (Rs.)", ""].map(h => (
-                <th key={h} style={{ padding: "10px 12px", textAlign: "left", fontWeight: 700, whiteSpace: "nowrap" }}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((item, idx) => (
-              <tr key={idx} style={{ background: idx % 2 === 0 ? "#f8fafc" : "#fff", borderBottom: "1px solid #e2e8f0" }}>
-                <td style={{ padding: "8px 12px", fontWeight: 700, color: "#1A4480", width: 46 }}>{idx + 1}</td>
-                <td style={{ padding: "6px 8px", minWidth: 240 }}>
-                  <input
-                    ref={el => inputRefs.current[idx] = el}
-                    value={item.item_name}
-                    onChange={e => handleSearch(idx, e.target.value, e.target)}
-                    onKeyDown={e => handleKeyDown(e, idx)}
-                    placeholder="Search product..."
-                    style={{ ...inp, padding: "7px 10px" }}
-                    onFocus={e => {
-                      if (item.item_name.length >= 1) {
-                        handleSearch(idx, item.item_name, e.target);
-                      }
-                      setSearchIdx(idx);
-                    }}
-                    onBlur={() => setTimeout(() => { setSearchResults([]); setSearchIdx(null); }, 200)}
-                    autoComplete="off"
-                  />
-                </td>
-                <td style={{ padding: "8px 10px", color: "#64748b", whiteSpace: "nowrap", fontSize: 13 }}>{item.unit || "—"}</td>
-                <td style={{ padding: "6px 8px", width: 110 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-                    <button onMouseDown={() => updateItem(idx, "qty", Math.max(1, (parseFloat(item.qty) || 1) - 1))}
-                      style={{ width: 26, height: 26, borderRadius: 5, border: "1.5px solid #e2e8f0", background: "#f8fafc", cursor: "pointer", fontWeight: 700, fontSize: 14 }}>-</button>
-                    <input
-                      id={`qty-${idx}`}
-                      value={item.qty}
-                      onChange={e => updateItem(idx, "qty", e.target.value)}
-                      onKeyDown={e => handleQtyKeyDown(e, idx)}
-                      style={{ width: 46, padding: "5px", border: "1.5px solid #e2e8f0", borderRadius: 6, fontSize: 14, textAlign: "center", outline: "none" }}
-                    />
-                    <button onMouseDown={() => updateItem(idx, "qty", (parseFloat(item.qty) || 0) + 1)}
-                      style={{ width: 26, height: 26, borderRadius: 5, border: "1.5px solid #e2e8f0", background: "#f8fafc", cursor: "pointer", fontWeight: 700, fontSize: 14 }}>+</button>
-                  </div>
-                </td>
-                <td style={{ padding: "8px 10px", fontWeight: 700 }}>Rs.{formatINR(item.rate)}</td>
-                <td style={{ padding: "6px 8px" }}>
-                  {editingRate === idx ? (
-                    <input autoFocus value={item.rate} onChange={e => updateItem(idx, "rate", e.target.value)}
-                      onBlur={() => setEditingRate(null)}
-                      onKeyDown={e => e.key === "Enter" && setEditingRate(null)}
-                      style={{ width: 80, padding: "5px 7px", border: "2px solid #f59e0b", borderRadius: 6, fontSize: 13, outline: "none" }} />
-                  ) : (
-                    <button onClick={() => setEditingRate(idx)}
-                      style={{ background: "#fffbeb", border: "1.5px solid #f59e0b", borderRadius: 6, padding: "5px 10px", fontSize: 12, cursor: "pointer", color: "#92400e", fontWeight: 600 }}>
-                      Edit
-                    </button>
-                  )}
-                </td>
-                <td style={{ padding: "8px 10px", fontWeight: 700, color: "#059669" }}>Rs.{formatINR(item.amount)}</td>
-                <td style={{ padding: "6px 8px" }}>
-                  <button onClick={() => removeRow(idx)}
-                    style={{ background: "#fee2e2", border: "none", borderRadius: 6, width: 26, height: 26, cursor: "pointer", color: "#dc2626", fontSize: 15, fontWeight: 700 }}>x</button>
-                </td>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+            <thead>
+              <tr style={{ background: "#1A4480", color: "#fff" }}>
+                {["S.No", "Item Name", "Unit", "Qty", "Rate (Rs.)", "Edit Rate", "Amount (Rs.)", ""].map(h => (
+                  <th key={h} style={{ padding: "10px 12px", textAlign: "left", fontWeight: 700, whiteSpace: "nowrap" }}>{h}</th>
+                ))}
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {items.map((item, idx) => (
+                <tr key={idx} style={{ background: idx % 2 === 0 ? "#f8fafc" : "#fff", borderBottom: "1px solid #e2e8f0" }}>
+                  <td style={{ padding: "8px 12px", fontWeight: 700, color: "#1A4480", width: 46 }}>{idx + 1}</td>
+                  <td style={{ padding: "6px 8px", minWidth: 260 }}>
+                    <input
+                      ref={el => searchInputRefs.current[idx] = el}
+                      value={item.item_name}
+                      onChange={e => handleSearch(idx, e.target.value)}
+                      onKeyDown={e => handleSearchKeyDown(e, idx)}
+                      placeholder="Type to search..."
+                      style={{ ...inp, padding: "7px 10px" }}
+                      onFocus={e => {
+                        setSearchIdx(idx);
+                        if (item.item_name) handleSearch(idx, item.item_name);
+                      }}
+                      onBlur={() => setTimeout(() => { setSearchResults([]); setSearchIdx(null); }, 200)}
+                      autoComplete="off"
+                    />
+                  </td>
+                  <td style={{ padding: "8px 10px", color: "#64748b", whiteSpace: "nowrap", fontSize: 13, minWidth: 90 }}>{item.unit}</td>
+                  <td style={{ padding: "6px 8px", width: 110 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                      <button onMouseDown={() => updateItem(idx, "qty", Math.max(0, (parseFloat(item.qty) || 0) - 1))}
+                        style={{ width: 28, height: 28, borderRadius: 6, border: "1.5px solid #e2e8f0", background: "#f8fafc", cursor: "pointer", fontWeight: 700, fontSize: 16 }}>-</button>
+                      <input
+                        ref={el => qtyInputRefs.current[idx] = el}
+                        value={item.qty}
+                        onChange={e => updateItem(idx, "qty", e.target.value)}
+                        onKeyDown={e => handleQtyKeyDown(e, idx)}
+                        style={{ width: 50, padding: "6px 4px", border: "1.5px solid #e2e8f0", borderRadius: 6, fontSize: 14, textAlign: "center", outline: "none" }}
+                        placeholder="Qty"
+                      />
+                      <button onMouseDown={() => updateItem(idx, "qty", (parseFloat(item.qty) || 0) + 1)}
+                        style={{ width: 28, height: 28, borderRadius: 6, border: "1.5px solid #e2e8f0", background: "#f8fafc", cursor: "pointer", fontWeight: 700, fontSize: 16 }}>+</button>
+                    </div>
+                  </td>
+                  <td style={{ padding: "8px 10px", fontWeight: 700, whiteSpace: "nowrap" }}>Rs.{formatINR(item.rate)}</td>
+                  <td style={{ padding: "6px 8px" }}>
+                    {editingRate === idx ? (
+                      <input autoFocus value={item.rate}
+                        onChange={e => updateItem(idx, "rate", e.target.value)}
+                        onBlur={() => setEditingRate(null)}
+                        onKeyDown={e => { if (e.key === "Enter") setEditingRate(null); }}
+                        style={{ width: 80, padding: "5px 7px", border: "2px solid #f59e0b", borderRadius: 6, fontSize: 13, outline: "none" }} />
+                    ) : (
+                      <button onClick={() => setEditingRate(idx)}
+                        style={{ background: "#fffbeb", border: "1.5px solid #f59e0b", borderRadius: 6, padding: "5px 10px", fontSize: 12, cursor: "pointer", color: "#92400e", fontWeight: 600 }}>Edit</button>
+                    )}
+                  </td>
+                  <td style={{ padding: "8px 10px", fontWeight: 700, color: "#059669", whiteSpace: "nowrap" }}>Rs.{formatINR(item.amount)}</td>
+                  <td style={{ padding: "6px 8px" }}>
+                    <button onClick={() => removeRow(idx)}
+                      style={{ background: "#fee2e2", border: "none", borderRadius: 6, width: 28, height: 28, cursor: "pointer", color: "#dc2626", fontWeight: 700, fontSize: 16 }}>x</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
         <button onClick={addRow}
           style={{ marginTop: 10, background: "#eff6ff", border: "2px dashed #1A4480", borderRadius: 8, padding: "9px 0", fontSize: 13, fontWeight: 600, color: "#1A4480", cursor: "pointer", width: "100%" }}>
           + Add Item &nbsp;(or press Enter after entering quantity)
         </button>
       </div>
-
-      {/* DROPDOWN — fixed position so it appears on screen regardless of scroll */}
-      {searchIdx !== null && searchResults.length > 0 && (
-        <div style={{
-          position: "fixed",
-          top: dropdownPos.top,
-          left: dropdownPos.left,
-          width: Math.max(dropdownPos.width, 400),
-          background: "#fff",
-          border: "2px solid #1A4480",
-          borderRadius: 10,
-          zIndex: 99999,
-          maxHeight: 320,
-          overflowY: "auto",
-          boxShadow: "0 12px 40px rgba(0,0,0,0.20)"
-        }}>
-          <div style={{ padding: "8px 14px", background: "#1A4480", color: "#fff", fontSize: 12, fontWeight: 600 }}>
-            {searchResults.length} item(s) found — click to select
-          </div>
-          {searchResults.map((r, ri) => (
-            <div key={ri}
-              onMouseDown={(e) => { e.preventDefault(); selectProduct(searchIdx, r); }}
-              style={{
-                padding: "11px 14px", cursor: "pointer",
-                borderBottom: "1px solid #f1f5f9",
-                display: "flex", justifyContent: "space-between", alignItems: "center",
-                background: "#fff"
-              }}
-              onMouseEnter={e => e.currentTarget.style.background = "#eff6ff"}
-              onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
-              <div>
-                <div style={{ fontWeight: 600, fontSize: 14, color: "#0B1F3A" }}>{r.item_name}</div>
-                <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>{r.tab} &bull; {r.unit}</div>
-              </div>
-              <div style={{ fontWeight: 800, color: r.price > 0 ? "#1A4480" : "#94a3b8", fontSize: 15, flexShrink: 0, marginLeft: 16 }}>
-                {r.price > 0 ? `Rs.${formatINR(r.price)}` : "No price"}
-              </div>
-            </div>
-          ))}
-          <div
-            onMouseDown={() => { setNewItemData(p => ({ ...p, item_name: items[searchIdx]?.item_name || "" })); setShowNewItemModal(true); setSearchResults([]); }}
-            style={{ padding: "10px 14px", cursor: "pointer", background: "#fffbeb", color: "#92400e", fontWeight: 600, fontSize: 12, borderTop: "2px solid #fde68a" }}>
-            + Not found? Add to price list
-          </div>
-        </div>
-      )}
 
       {/* Options & Totals */}
       <div style={{ background: "#fff", borderRadius: 14, padding: 20, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.06)" }}>
@@ -358,7 +349,7 @@ export default function NewBill({ token }) {
               { label: "Discount", enabled: discountEnabled, setEnabled: setDiscountEnabled, color: "#f59e0b",
                 extra: discountEnabled && (
                   <input type="number" value={discountAmt} onChange={e => setDiscountAmt(e.target.value)}
-                    placeholder="Rs.0" style={{ width: 80, padding: "4px 8px", border: "1.5px solid #f59e0b", borderRadius: 6, fontSize: 13, outline: "none" }} />
+                    placeholder="Rs.0" style={{ width: 90, padding: "4px 8px", border: "1.5px solid #f59e0b", borderRadius: 6, fontSize: 13, outline: "none" }} />
                 )
               }
             ].map(({ label, enabled, setEnabled, color, extra }) => (
@@ -374,8 +365,7 @@ export default function NewBill({ token }) {
             ))}
             <div style={{ padding: 14, background: "#f8fafc", borderRadius: 10 }}>
               <label style={{ fontSize: 13, fontWeight: 600, color: "#374151", display: "block", marginBottom: 6 }}>Advance Payment (Rs.)</label>
-              <input type="number" value={advanceAmt} onChange={e => setAdvanceAmt(e.target.value)}
-                placeholder="0" style={{ ...inp, padding: "8px 12px" }} />
+              <input type="number" value={advanceAmt} onChange={e => setAdvanceAmt(e.target.value)} placeholder="0" style={{ ...inp, padding: "8px 12px" }} />
             </div>
           </div>
           <div>
@@ -394,7 +384,7 @@ export default function NewBill({ token }) {
                   </span>
                 </div>
               ))}
-              <div style={{ display: "flex", justifyContent: "space-between", padding: "14px 0 0" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 14 }}>
                 <span style={{ fontSize: 17, fontWeight: 800, color: "#0B1F3A" }}>GRAND TOTAL</span>
                 <span style={{ fontSize: 20, fontWeight: 900, color: "#1A4480" }}>Rs.{formatINR(Math.max(0, grandTotal))}</span>
               </div>
@@ -428,13 +418,14 @@ export default function NewBill({ token }) {
 
       {msg && (
         <div style={{
-          background: msg.includes("Error") || msg.includes("Please") ? "#fee2e2" : "#dcfce7",
+          background: msg.includes("Error") || msg.includes("Please") ? "#fef2f2" : "#f0fdf4",
           color: msg.includes("Error") || msg.includes("Please") ? "#dc2626" : "#166534",
+          border: `1px solid ${msg.includes("Error") || msg.includes("Please") ? "#fecaca" : "#bbf7d0"}`,
           padding: "11px 16px", borderRadius: 8, marginBottom: 14, fontWeight: 600, fontSize: 13
         }}>{msg}</div>
       )}
 
-      <div style={{ display: "flex", gap: 10 }}>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
         <button onClick={handleSave} disabled={saving}
           style={{ background: "#1A4480", color: "#fff", border: "none", borderRadius: 10, padding: "13px 28px", fontSize: 15, fontWeight: 700, cursor: "pointer", opacity: saving ? 0.7 : 1 }}>
           {saving ? "Saving..." : "Save Bill"}
@@ -451,12 +442,12 @@ export default function NewBill({ token }) {
 
       {/* New Item Modal */}
       {showNewItemModal && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 999999, display: "flex", alignItems: "center", justifyContent: "center" }}>
-          <div style={{ background: "#fff", borderRadius: 14, padding: 28, width: "100%", maxWidth: 420 }}>
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 99999, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div style={{ background: "#fff", borderRadius: 14, padding: 28, width: "100%", maxWidth: 420, boxShadow: "0 24px 64px rgba(0,0,0,0.25)" }}>
             <h3 style={{ margin: "0 0 18px", color: "#0B1F3A", fontSize: 17, fontWeight: 800 }}>Add New Item to Price List</h3>
             {[
-              { label: "Item Name", key: "item_name", placeholder: '3" PVC Special Coupler' },
-              { label: "Unit", key: "unit", placeholder: "Per Piece / Per Meter" },
+              { label: "Item Name", key: "item_name", placeholder: "e.g. 3\" PVC Special Coupler" },
+              { label: "Unit", key: "unit", placeholder: "Per Piece / Per Meter / Per Bundle" },
               { label: "Price (Rs.)", key: "price", placeholder: "Enter price", type: "number" }
             ].map(f => (
               <div key={f.key} style={{ marginBottom: 14 }}>
@@ -466,7 +457,7 @@ export default function NewBill({ token }) {
                   placeholder={f.placeholder} style={inp} />
               </div>
             ))}
-            <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
               <button onClick={handleAddNewItem}
                 style={{ flex: 1, background: "#1A4480", color: "#fff", border: "none", borderRadius: 8, padding: "11px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
                 Add to Price List
