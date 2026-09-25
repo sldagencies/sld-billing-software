@@ -23,6 +23,7 @@ export default function NewBill({ token }) {
   const [showNewItemModal, setShowNewItemModal] = useState(false);
   const [newItemData, setNewItemData] = useState({ item_name: "", unit: "Per Piece", price: "" });
   const [msg, setMsg] = useState("");
+  const [sharingWA, setSharingWA] = useState(false);
   const debounceRef = useRef(null);
   const searchInputRefs = useRef({});
   const qtyInputRefs = useRef({});
@@ -157,6 +158,80 @@ export default function NewBill({ token }) {
     setSavedBill(null); setShowPrint(false); setMsg("");
   };
 
+  const handleShareWhatsApp = async () => {
+    if (!savedBill) return;
+    setSharingWA(true); setMsg("");
+    try {
+      // Load html2canvas + jsPDF from CDN if not already loaded
+      if (!window.html2canvas) {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
+          s.onload = resolve; s.onerror = reject;
+          document.head.appendChild(s);
+        });
+      }
+      if (!window.jspdf) {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement("script");
+          s.src = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js";
+          s.onload = resolve; s.onerror = reject;
+          document.head.appendChild(s);
+        });
+      }
+
+      const el = document.getElementById("bill-print-area");
+      const canvas = await window.html2canvas(el, { scale: 2, useCORS: true });
+      const imgData = canvas.toDataURL("image/png");
+
+      const { jsPDF } = window.jspdf;
+      const pdf = new jsPDF("p", "mm", "a4");
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const imgWidth = pageWidth;
+      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+      let heightLeft = imgHeight;
+      let position = 0;
+      pdf.addImage(imgData, "PNG", 0, position, imgWidth, imgHeight);
+      heightLeft -= pageHeight;
+      while (heightLeft > 0) {
+        position = heightLeft - imgHeight;
+        pdf.addPage();
+        pdf.addImage(imgData, "PNG", 0, position, imgWidth, imgHeight);
+        heightLeft -= pageHeight;
+      }
+
+      const fileName = `Bill_${savedBill.bill_number}.pdf`;
+      const pdfBlob = pdf.output("blob");
+      const pdfFile = new File([pdfBlob], fileName, { type: "application/pdf" });
+
+      // Try native share (works on mobile — opens WhatsApp share sheet directly)
+      if (navigator.canShare && navigator.canShare({ files: [pdfFile] })) {
+        await navigator.share({
+          files: [pdfFile],
+          title: `Bill ${savedBill.bill_number}`,
+          text: `Bill ${savedBill.bill_number} from Sree Laxmidurga Agencies — Total: Rs.${formatINR(savedBill.grand_total)}`
+        });
+        setMsg("Bill shared successfully!");
+      } else {
+        // Fallback: download PDF + open WhatsApp chat with message
+        pdf.save(fileName);
+        const phone = savedBill.customer_phone.replace(/\D/g, "");
+        const waPhone = phone.length === 10 ? `91${phone}` : phone;
+        const text = encodeURIComponent(
+          `Dear ${savedBill.customer_name}, your bill ${savedBill.bill_number} from Sree Laxmidurga Agencies — Total: Rs.${formatINR(savedBill.grand_total)}. PDF downloaded, please attach it here. Thank you!`
+        );
+        window.open(`https://wa.me/${waPhone}?text=${text}`, "_blank");
+        setMsg("PDF downloaded. WhatsApp opened — please attach the downloaded PDF manually.");
+      }
+    } catch (e) {
+      console.error(e);
+      setMsg("Error: Could not prepare PDF for sharing. Try Print Bill instead.");
+    } finally {
+      setSharingWA(false);
+    }
+  };
+
   const handleAddNewItem = async () => {
     if (!newItemData.item_name || !newItemData.price) return;
     try {
@@ -167,21 +242,36 @@ export default function NewBill({ token }) {
     } catch { setMsg("Failed to add item"); }
   };
 
-  const btn = (color, active) => ({
-    padding: "8px 18px", borderRadius: 8, fontSize: 13, fontWeight: 600,
-    cursor: "pointer", border: `2px solid ${color}`,
-    background: active ? color : "#fff", color: active ? "#fff" : color
+  const segBtn = (active, activeBg, activeText) => ({
+    padding: "9px 20px",
+    fontSize: 13.5,
+    fontWeight: 600,
+    cursor: "pointer",
+    border: "none",
+    borderRadius: 7,
+    background: active ? activeBg : "transparent",
+    color: active ? activeText : "#64748b",
+    transition: "all 0.15s",
   });
+  const segGroup = { display: "inline-flex", gap: 2, background: "#f1f5f9", borderRadius: 10, padding: 3, border: "1px solid #e2e8f0" };
 
   const inp = { width: "100%", padding: "10px 14px", border: "1.5px solid #e2e8f0", borderRadius: 8, fontSize: 14, outline: "none", boxSizing: "border-box" };
 
   if (showPrint && savedBill) return (
     <div>
-      <div style={{ display: "flex", gap: 12, marginBottom: 20 }}>
+      <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
         <button onClick={() => window.print()} style={{ background: "#1A4480", color: "#fff", border: "none", borderRadius: 8, padding: "11px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>Print Bill</button>
+        <button onClick={handleShareWhatsApp} disabled={sharingWA} style={{ background: "#25D366", color: "#fff", border: "none", borderRadius: 8, padding: "11px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer", opacity: sharingWA ? 0.7 : 1 }}>
+          {sharingWA ? "Preparing PDF..." : "Share on WhatsApp"}
+        </button>
         <button onClick={handleNewBill} style={{ background: "#059669", color: "#fff", border: "none", borderRadius: 8, padding: "11px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>New Bill</button>
       </div>
-      <BillPrint bill={savedBill} />
+      {msg && (
+        <div style={{ background: msg.includes("Error") ? "#fef2f2" : "#f0fdf4", color: msg.includes("Error") ? "#dc2626" : "#166534", padding: "10px 16px", borderRadius: 8, marginBottom: 16, fontWeight: 600, fontSize: 13 }}>{msg}</div>
+      )}
+      <div id="bill-print-area">
+        <BillPrint bill={savedBill} />
+      </div>
     </div>
   );
 
@@ -394,22 +484,30 @@ export default function NewBill({ token }) {
       </div>
 
       {/* Payment */}
-      <div style={{ background: "#fff", borderRadius: 14, padding: 20, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.06)" }}>
-        <h3 style={{ margin: "0 0 14px", color: "#0B1F3A", fontSize: 15, fontWeight: 700 }}>Payment</h3>
-        <div style={{ display: "flex", gap: 28, flexWrap: "wrap" }}>
+      <div style={{ background: "#fff", borderRadius: 14, padding: 22, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.06)" }}>
+        <h3 style={{ margin: "0 0 16px", color: "#0B1F3A", fontSize: 15, fontWeight: 700 }}>Payment</h3>
+        <div style={{ display: "flex", gap: 36, flexWrap: "wrap" }}>
           <div>
-            <div style={{ fontSize: 12, fontWeight: 600, color: "#374151", marginBottom: 8 }}>Status</div>
-            <div style={{ display: "flex", gap: 8 }}>
-              {[["paid","#059669","Paid"],["credit","#dc2626","Credit"],["partial","#f59e0b","Partial"]].map(([v,c,l]) => (
-                <button key={v} onClick={() => setPayStatus(v)} style={btn(c, payStatus === v)}>{l}</button>
+            <div style={{ fontSize: 12, fontWeight: 600, color: "#64748b", marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.3 }}>Status</div>
+            <div style={segGroup}>
+              {[
+                ["paid",    "#0f766e", "#fff", "Paid"],
+                ["credit",  "#9a3412", "#fff", "Credit"],
+                ["partial", "#854d0e", "#fff", "Partial"],
+              ].map(([v, bg, text, l]) => (
+                <button key={v} onClick={() => setPayStatus(v)} style={segBtn(payStatus === v, bg, text)}>{l}</button>
               ))}
             </div>
           </div>
           <div>
-            <div style={{ fontSize: 12, fontWeight: 600, color: "#374151", marginBottom: 8 }}>Method</div>
-            <div style={{ display: "flex", gap: 8 }}>
-              {[["cash","#374151","Cash"],["upi","#6366f1","UPI"],["credit","#dc2626","Credit"]].map(([v,c,l]) => (
-                <button key={v} onClick={() => setPayMethod(v)} style={btn(c, payMethod === v)}>{l}</button>
+            <div style={{ fontSize: 12, fontWeight: 600, color: "#64748b", marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.3 }}>Method</div>
+            <div style={segGroup}>
+              {[
+                ["cash",   "#1A4480", "#fff", "Cash"],
+                ["upi",    "#1A4480", "#fff", "UPI"],
+                ["credit", "#1A4480", "#fff", "Credit"],
+              ].map(([v, bg, text, l]) => (
+                <button key={v} onClick={() => setPayMethod(v)} style={segBtn(payMethod === v, bg, text)}>{l}</button>
               ))}
             </div>
           </div>
@@ -435,7 +533,7 @@ export default function NewBill({ token }) {
           New Bill
         </button>
         <button onClick={() => setItems([{ ...EMPTY_ITEM }])}
-          style={{ background: "#fff", color: "#dc2626", border: "2px solid #dc2626", borderRadius: 10, padding: "13px 22px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+          style={{ background: "#fff", color: "#9a3412", border: "1.5px solid #e2e8f0", borderRadius: 10, padding: "13px 22px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
           Clear
         </button>
       </div>
