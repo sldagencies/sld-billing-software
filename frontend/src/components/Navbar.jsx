@@ -1,18 +1,20 @@
 export default function Navbar({ page, setPage, role, username, onLogout }) {
   const s = (id) => ({
-    padding: "10px 16px", cursor: "pointer", borderRadius: 6, fontSize: 14,
+    padding: "10px 14px", cursor: "pointer", borderRadius: 6, fontSize: 13.5,
     fontWeight: 600, border: "none",
     background: page === id ? "#1A4480" : "transparent",
     color: page === id ? "#fff" : "#334155",
-    transition: "all 0.15s"
+    transition: "all 0.15s", whiteSpace: "nowrap"
   });
 
   const navItems = [
-    { id: "dashboard", label: "Dashboard" },
-    { id: "newbill",   label: "New Bill" },
-    { id: "history",   label: "Bills History" },
-    { id: "customers", label: "Customers" },
-    { id: "credit",    label: "Credit / Pending" },
+    { id: "dashboard",   label: "Dashboard" },
+    { id: "newbill",     label: "New Bill" },
+    { id: "shopbilling", label: "Shop Billing" },
+    { id: "quotation",   label: "Quotation" },
+    { id: "history",     label: "Bills History" },
+    { id: "customers",   label: "Customers" },
+    { id: "credit",      label: "Credit / Pending" },
     ...(role === "owner" ? [{ id: "reports",  label: "Reports" }] : []),
     ...(role === "owner" ? [{ id: "settings", label: "Settings" }] : []),
   ];
@@ -24,7 +26,6 @@ export default function Navbar({ page, setPage, role, username, onLogout }) {
       gap: 4, flexWrap: "wrap", position: "sticky", top: 0, zIndex: 100,
       boxShadow: "0 2px 8px rgba(0,0,0,0.06)"
     }}>
-      {/* Logo */}
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginRight: 20, padding: "10px 0" }}>
         <div style={{ background: "#1A4480", borderRadius: 8, width: 36, height: 36,
           display: "flex", alignItems: "center", justifyContent: "center",
@@ -35,14 +36,12 @@ export default function Navbar({ page, setPage, role, username, onLogout }) {
         </div>
       </div>
 
-      {/* Nav links */}
       <div style={{ display: "flex", gap: 2, flex: 1, flexWrap: "wrap" }}>
         {navItems.map(n => (
           <button key={n.id} style={s(n.id)} onClick={() => setPage(n.id)}>{n.label}</button>
         ))}
       </div>
 
-      {/* User info */}
       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0" }}>
         <div style={{ fontSize: 13, color: "#475569" }}>
           <strong>{username}</strong>

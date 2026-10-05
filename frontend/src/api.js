@@ -1,25 +1,31 @@
 const BASE = import.meta.env.VITE_API_URL || "https://sld-billing-software-production.up.railway.app";
 
+async function fetchWithRetry(url, options, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `Server error (${res.status})`);
+      }
+      return res.json();
+    } catch (err) {
+      const isLast = i === retries - 1;
+      if (isLast) {
+        if (err.message === "Failed to fetch" || err.name === "TypeError") {
+          throw new Error("Server is starting up. Please wait 10 seconds and try again.");
+        }
+        throw err;
+      }
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  }
+}
+
 export async function api(path, method = "GET", body = null, token = null) {
   const headers = { "Content-Type": "application/json" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
-  try {
-    const res = await fetch(`${BASE}${path}`, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : null,
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || `Server error (${res.status})`);
-    }
-    return res.json();
-  } catch (err) {
-    if (err.message === "Failed to fetch") {
-      throw new Error("Cannot connect to server. Please check your internet connection.");
-    }
-    throw err;
-  }
+  return fetchWithRetry(`${BASE}${path}`, { method, headers, body: body ? JSON.stringify(body) : null });
 }
 
 export const login = (u, p) => api("/api/login", "POST", { username: u, password: p });
@@ -40,6 +46,22 @@ export const togglePin = (id, p, t) => api(`/api/bills/${id}/pin?pinned=${p}`, "
 export const deleteBill = (id, t) => api(`/api/bills/${id}`, "DELETE", null, t);
 export const addNewItem = (item, t) => api("/api/products/new", "POST", item, t);
 export const adjustPrices = (d, t) => api("/api/products/adjust-price", "POST", d, t);
+
+// Shop billing
+export const createShopBill = (b, t) => api("/api/shop-bills", "POST", b, t);
+export const getShopBills = (s, t) => api(`/api/shop-bills${s ? `?search=${s}` : ""}`, "GET", null, t);
+export const getPinnedShopBills = (t) => api("/api/shop-bills/pinned", "GET", null, t);
+export const updateShopBillPayment = (id, status, t) => api(`/api/shop-bills/${id}/payment?payment_status=${status}`, "PATCH", null, t);
+export const deleteShopBill = (id, t) => api(`/api/shop-bills/${id}`, "DELETE", null, t);
+
+// Quotations
+export const createQuotation = (q, t) => api("/api/quotations", "POST", q, t);
+export const getQuotations = (s, t) => api(`/api/quotations${s ? `?search=${s}` : ""}`, "GET", null, t);
+export const deleteQuotation = (id, t) => api(`/api/quotations/${id}`, "DELETE", null, t);
+
+// Motors
+export const getMotors = (s, t) => api(`/api/motors${s ? `?search=${s}` : ""}`, "GET", null, t);
+export const updateMotorSerial = (id, serial, t) => api(`/api/motors/${id}?serial_number=${encodeURIComponent(serial)}`, "PATCH", null, t);
 
 export const formatINR = (n) => {
   if (!n && n !== 0) return "0.00";

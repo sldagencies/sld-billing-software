@@ -3,27 +3,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
-import re
-import os
+import os, re, json, jwt
 from supabase import create_client, Client
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from datetime import datetime, date
-import json
-import jwt
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="SLD Billing Software API", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="SLD Billing Software API", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
@@ -48,25 +38,14 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     except:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# All tabs with their start rows
-ALL_TABS = [
-    ("PVC", 4), ("CPVC", 4), ("UPVC", 4), ("SWR Drainage", 4),
-    ("GI & Brass", 4), ("Motors & Pumps", 4), ("Water Tanks", 4),
-    ("Sanitary Ware", 4), ("Taps & Valves", 4), ("Column Pipes", 4),
-    ("Solvents", 4), ("Miscellaneous", 4), ("New Items", 2),
-]
-
 def normalize(text: str) -> str:
-    """Remove quotes so 3" PVC becomes 3 pvc"""
-    import re as _re
     text = text.lower()
-    text = _re.sub(r'["“”/\\]', ' ', text)
-    text = _re.sub(r"'", ' ', text)
-    text = _re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'["\u201c\u201d/\\]', ' ', text)
+    text = re.sub(r"'", ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 def score_match(item_key: str, search_words: list) -> int:
-    """Word-boundary scoring: 4 pvc excludes 5 pvc pipe 4kg"""
     item_words = item_key.split()
     score = 0
     for sw in search_words:
@@ -74,17 +53,22 @@ def score_match(item_key: str, search_words: list) -> int:
         for iw in item_words:
             if sw == iw:
                 score += 10; found = True; break
-            elif (not sw.replace('.','').isdigit()) and iw.startswith(sw) and len(sw) >= 2:
+            elif (not sw.replace('.', '').isdigit()) and iw.startswith(sw) and len(sw) >= 2:
                 score += 3; found = True; break
         if not found:
-            if (not sw.replace('.','').isdigit()) and sw in item_key:
+            if (not sw.replace('.', '').isdigit()) and sw in item_key:
                 score += 1
             else:
                 return -1
     return score
 
+ALL_TABS = [
+    ("PVC", 4), ("CPVC", 4), ("UPVC", 4), ("SWR Drainage", 4),
+    ("GI & Brass", 4), ("Motors & Pumps", 4), ("Water Tanks", 4),
+    ("Sanitary Ware", 4), ("Taps & Valves", 4), ("Column Pipes", 4),
+    ("Solvents", 4), ("Miscellaneous", 4), ("New Items", 2),
+]
 
-# Cache: load all products once into memory
 _product_cache = []
 _cache_loaded = False
 
@@ -92,50 +76,45 @@ def load_all_products():
     global _product_cache, _cache_loaded
     if _cache_loaded:
         return _product_cache
-
     sheets = get_sheets_service()
     ranges = [f"'{tab}'!B{start}:D200" for tab, start in ALL_TABS]
     try:
-        resp = sheets.values().batchGet(
-            spreadsheetId=SHEET_ID,
-            ranges=ranges
-        ).execute()
+        resp = sheets.values().batchGet(spreadsheetId=SHEET_ID, ranges=ranges).execute()
         value_ranges = resp.get("valueRanges", [])
         products = []
         skip = {"—", "", "item", "product", "s. no", "s.no"}
         for i, vr in enumerate(value_ranges):
             tab = ALL_TABS[i][0]
-            rows = vr.get("values", [])
-            for row in rows:
+            for row in vr.get("values", []):
                 if not row: continue
                 item_name = str(row[0]).strip() if len(row) > 0 else ""
                 unit = str(row[1]).strip() if len(row) > 1 else "Per Piece"
                 price_raw = str(row[2]).strip() if len(row) > 2 else "0"
                 if not item_name or item_name.lower() in skip:
                     continue
-                try:
-                    price = float(price_raw.replace(",", ""))
-                except:
-                    price = 0.0
+                try: price = float(price_raw.replace(",", ""))
+                except: price = 0.0
                 products.append({
-                    "item_name": item_name,
-                    "unit": unit,
-                    "price": price,
-                    "tab": tab,
-                    "search_key": normalize(item_name)  # normalized for fuzzy search
+                    "item_name": item_name, "unit": unit, "price": price,
+                    "tab": tab, "search_key": normalize(item_name)
                 })
         _product_cache = products
         _cache_loaded = True
-        print(f"✅ Cache loaded: {len(products)} products")
         return products
     except Exception as e:
-        print(f"❌ Cache load error: {e}")
+        print(f"Cache load error: {e}")
         return []
 
 def invalidate_cache():
     global _cache_loaded
     _cache_loaded = False
 
+def is_motor_item(item_name: str) -> bool:
+    """Detect if item is a motor (needs serial number tracking)"""
+    name_lower = item_name.lower()
+    return "motor" in name_lower or "cri" in name_lower or "pump" in name_lower
+
+# ── Models ──────────────────────────────────────────
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -151,6 +130,7 @@ class BillItem(BaseModel):
     qty: float
     rate: float
     amount: float
+    serial_number: Optional[str] = None  # for motors
 
 class Bill(BaseModel):
     customer_name: str
@@ -191,32 +171,76 @@ class PriceAdjustRequest(BaseModel):
     adjustment_type: str
     adjustment_value: float
 
+# Shop billing (to other shops — no bill number, no auto price)
+class ShopBillItem(BaseModel):
+    item_name: str
+    unit: Optional[str] = ""
+    qty: float
+    rate: float
+    amount: float
+
+class ShopBill(BaseModel):
+    shop_name: str
+    shop_phone: Optional[str] = None
+    shop_address: Optional[str] = None
+    items: List[ShopBillItem]
+    subtotal: float
+    grand_total: float
+    payment_status: str = "credit"
+    notes: Optional[str] = None
+
+# Quotation
+class QuotationItem(BaseModel):
+    item_name: str
+    unit: str
+    qty: float
+    rate: float
+    amount: float
+
+class Quotation(BaseModel):
+    customer_name: str
+    customer_phone: Optional[str] = None
+    items: List[QuotationItem]
+    subtotal: float
+    gst_enabled: bool = False
+    gst_rate: float = 18.0
+    gst_amount: float = 0.0
+    grand_total: float
+
 def generate_bill_number():
     today = datetime.now()
     prefix = f"SLD{today.strftime('%y%m')}"
     result = supabase.table("bills").select("bill_number").ilike(
         "bill_number", f"{prefix}%").order("bill_number", desc=True).limit(1).execute()
     if result.data:
-        try:
-            seq = int(result.data[0]["bill_number"][-4:]) + 1
-        except:
-            seq = 1
+        try: seq = int(result.data[0]["bill_number"][-4:]) + 1
+        except: seq = 1
     else:
         seq = 1
     return f"{prefix}{seq:04d}"
 
+def generate_quotation_number():
+    today = datetime.now()
+    prefix = f"QT{today.strftime('%y%m')}"
+    result = supabase.table("quotations").select("quotation_number").ilike(
+        "quotation_number", f"{prefix}%").order("quotation_number", desc=True).limit(1).execute()
+    if result.data:
+        try: seq = int(result.data[0]["quotation_number"][-4:]) + 1
+        except: seq = 1
+    else:
+        seq = 1
+    return f"{prefix}{seq:04d}"
+
+# ── Auth ──────────────────────────────────────────────
 @app.post("/api/login", response_model=Token)
 def login(req: LoginRequest):
     user = USERS.get(req.username)
     if not user or user["password"] != req.password:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = jwt.encode(
-        {"username": req.username, "role": user["role"]},
-        SECRET_KEY, algorithm="HS256"
-    )
+    token = jwt.encode({"username": req.username, "role": user["role"]}, SECRET_KEY, algorithm="HS256")
     return {"access_token": token, "role": user["role"], "username": req.username}
 
-# ── SEARCH — word-boundary matching, numbers must be exact ──
+# ── Product Search ──────────────────────────────────────
 @app.get("/api/products/search")
 def search_products(q: str, user=Depends(verify_token)):
     if not q or len(q) < 1:
@@ -234,26 +258,23 @@ def search_products(q: str, user=Depends(verify_token)):
     scored.sort(key=lambda x: x[0], reverse=True)
     return [p for _, p in scored[:25]]
 
-# ── RELOAD CACHE (call after price updates) ──
 @app.post("/api/products/reload-cache")
 def reload_cache(user=Depends(verify_token)):
     invalidate_cache()
-    products = load_all_products()
-    return {"message": f"Cache reloaded with {len(products)} products"}
+    return {"message": f"Cache reloaded with {len(load_all_products())} products"}
 
 @app.post("/api/products/new")
 def add_new_item(item: NewItemRequest, user=Depends(verify_token)):
     sheets = get_sheets_service()
     try:
-        resp = sheets.values().get(
-            spreadsheetId=SHEET_ID, range="'New Items'!A:D").execute()
+        resp = sheets.values().get(spreadsheetId=SHEET_ID, range="'New Items'!A:D").execute()
         sno = max(len(resp.get("values", [])), 1)
         sheets.values().append(
             spreadsheetId=SHEET_ID, range="'New Items'!A:D",
             valueInputOption="USER_ENTERED",
             body={"values": [[sno, item.item_name, item.unit, item.price]]}
         ).execute()
-        invalidate_cache()  # refresh cache
+        invalidate_cache()
         return {"message": f"'{item.item_name}' added successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -264,10 +285,7 @@ def adjust_prices(req: PriceAdjustRequest, user=Depends(verify_token)):
         raise HTTPException(status_code=403, detail="Owner access only")
     sheets = get_sheets_service()
     try:
-        resp = sheets.values().get(
-            spreadsheetId=SHEET_ID,
-            range=f"'{req.tab_name}'!A4:D500"
-        ).execute()
+        resp = sheets.values().get(spreadsheetId=SHEET_ID, range=f"'{req.tab_name}'!A4:D500").execute()
         rows = resp.get("values", [])
         updates = []
         for i, row in enumerate(rows):
@@ -275,25 +293,17 @@ def adjust_prices(req: PriceAdjustRequest, user=Depends(verify_token)):
                 try:
                     old = float(str(row[3]).replace(",", "").strip())
                     if old > 0:
-                        new = round(old * (1 + req.adjustment_value/100), 2) \
-                            if req.adjustment_type == "percentage" \
-                            else round(old + req.adjustment_value, 2)
-                        updates.append({
-                            "range": f"'{req.tab_name}'!D{i+4}",
-                            "values": [[new]]
-                        })
-                except:
-                    continue
+                        new = round(old * (1 + req.adjustment_value / 100), 2) if req.adjustment_type == "percentage" else round(old + req.adjustment_value, 2)
+                        updates.append({"range": f"'{req.tab_name}'!D{i+4}", "values": [[new]]})
+                except: continue
         if updates:
-            sheets.values().batchUpdate(
-                spreadsheetId=SHEET_ID,
-                body={"valueInputOption": "USER_ENTERED", "data": updates}
-            ).execute()
+            sheets.values().batchUpdate(spreadsheetId=SHEET_ID, body={"valueInputOption": "USER_ENTERED", "data": updates}).execute()
         invalidate_cache()
         return {"message": f"Updated {len(updates)} prices in {req.tab_name}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── Customer Bills ──────────────────────────────────────
 @app.post("/api/bills")
 def create_bill(bill: Bill, user=Depends(verify_token)):
     bill_number = generate_bill_number()
@@ -302,24 +312,24 @@ def create_bill(bill: Bill, user=Depends(verify_token)):
         "bill_number": bill_number, "created_at": now,
         "customer_name": bill.customer_name, "customer_phone": bill.customer_phone,
         "items": [i.dict() for i in bill.items], "subtotal": bill.subtotal,
-        "gst_enabled": bill.gst_enabled, "gst_rate": bill.gst_rate,
-        "gst_amount": bill.gst_amount, "discount_enabled": bill.discount_enabled,
-        "discount_amount": bill.discount_amount, "advance_amount": bill.advance_amount,
-        "grand_total": bill.grand_total, "payment_status": bill.payment_status,
-        "payment_method": bill.payment_method,
+        "gst_enabled": bill.gst_enabled, "gst_rate": bill.gst_rate, "gst_amount": bill.gst_amount,
+        "discount_enabled": bill.discount_enabled, "discount_amount": bill.discount_amount,
+        "advance_amount": bill.advance_amount, "grand_total": bill.grand_total,
+        "payment_status": bill.payment_status, "payment_method": bill.payment_method,
         "upi_transaction_id": bill.upi_transaction_id, "notes": bill.notes,
         "created_by": user["username"], "is_pinned": True,
         "return_amount": 0.0, "final_amount": bill.grand_total
     }
     result = supabase.table("bills").insert(data).execute()
-    existing = supabase.table("customers").select("*").eq(
-        "phone", bill.customer_phone).execute()
+    bill_id = result.data[0]["id"]
+
+    # customer upsert
+    existing = supabase.table("customers").select("*").eq("phone", bill.customer_phone).execute()
     if existing.data:
         c = existing.data[0]
         supabase.table("customers").update({
             "total_purchases": c["total_purchases"] + bill.grand_total,
-            "outstanding_credit": c["outstanding_credit"] + (
-                bill.grand_total if bill.payment_status == "credit" else 0),
+            "outstanding_credit": c["outstanding_credit"] + (bill.grand_total if bill.payment_status == "credit" else 0),
             "bill_count": c["bill_count"] + 1, "last_purchase": now
         }).eq("phone", bill.customer_phone).execute()
     else:
@@ -329,14 +339,28 @@ def create_bill(bill: Bill, user=Depends(verify_token)):
             "outstanding_credit": bill.grand_total if bill.payment_status == "credit" else 0,
             "bill_count": 1, "last_purchase": now
         }).execute()
+
     if bill.payment_status == "credit":
         supabase.table("credit_reminders").insert({
-            "bill_id": result.data[0]["id"], "bill_number": bill_number,
+            "bill_id": bill_id, "bill_number": bill_number,
             "customer_name": bill.customer_name, "customer_phone": bill.customer_phone,
-            "amount": bill.grand_total, "reminder_count": 0,
-            "status": "active", "created_at": now
+            "amount": bill.grand_total, "reminder_count": 0, "status": "active", "created_at": now
         }).execute()
-    return {"bill_number": bill_number, "id": result.data[0]["id"]}
+
+    # ── Auto-log motors for warranty registration ──
+    motor_rows = []
+    for item in bill.items:
+        if is_motor_item(item.item_name):
+            motor_rows.append({
+                "bill_id": bill_id, "bill_number": bill_number,
+                "customer_name": bill.customer_name, "customer_phone": bill.customer_phone,
+                "motor_name": item.item_name, "serial_number": item.serial_number or "",
+                "price": item.rate, "billing_date": now
+            })
+    if motor_rows:
+        supabase.table("motors").insert(motor_rows).execute()
+
+    return {"bill_number": bill_number, "id": bill_id}
 
 @app.get("/api/bills")
 def get_bills(status: Optional[str]=None, search: Optional[str]=None,
@@ -351,8 +375,7 @@ def get_bills(status: Optional[str]=None, search: Optional[str]=None,
 
 @app.get("/api/bills/pinned")
 def get_pinned_bills(user=Depends(verify_token)):
-    return supabase.table("bills").select("*").eq(
-        "is_pinned", True).order("created_at", desc=True).limit(20).execute().data
+    return supabase.table("bills").select("*").eq("is_pinned", True).order("created_at", desc=True).limit(20).execute().data
 
 @app.get("/api/bills/{bill_id}")
 def get_bill(bill_id: str, user=Depends(verify_token)):
@@ -374,8 +397,7 @@ def update_payment(bill_id: str, payment_status: str, payment_method: str,
         "paid_at": datetime.now().isoformat() if payment_status == "paid" else None
     }).eq("id", bill_id).execute()
     if payment_status == "paid":
-        supabase.table("credit_reminders").update(
-            {"status": "stopped"}).eq("bill_id", bill_id).execute()
+        supabase.table("credit_reminders").update({"status": "stopped"}).eq("bill_id", bill_id).execute()
     return {"message": "Updated"}
 
 @app.delete("/api/bills/{bill_id}")
@@ -405,18 +427,89 @@ def create_return(bill_id: str, ret: ReturnBill, user=Depends(verify_token)):
 
 @app.get("/api/bills/{bill_id}/returns")
 def get_returns(bill_id: str, user=Depends(verify_token)):
-    return supabase.table("return_bills").select("*").eq(
-        "original_bill_id", bill_id).execute().data
+    return supabase.table("return_bills").select("*").eq("original_bill_id", bill_id).execute().data
 
+# ── Shop Billing (separate tab — to other shops) ──────────
+@app.post("/api/shop-bills")
+def create_shop_bill(bill: ShopBill, user=Depends(verify_token)):
+    now = datetime.now().isoformat()
+    data = {
+        "created_at": now, "shop_name": bill.shop_name, "shop_phone": bill.shop_phone,
+        "shop_address": bill.shop_address, "items": [i.dict() for i in bill.items],
+        "subtotal": bill.subtotal, "grand_total": bill.grand_total,
+        "payment_status": bill.payment_status, "notes": bill.notes,
+        "created_by": user["username"], "is_pinned": True
+    }
+    result = supabase.table("shop_bills").insert(data).execute()
+    return {"id": result.data[0]["id"]}
+
+@app.get("/api/shop-bills")
+def get_shop_bills(search: Optional[str]=None, user=Depends(verify_token)):
+    query = supabase.table("shop_bills").select("*")
+    if search: query = query.ilike("shop_name", f"%{search}%")
+    return query.order("created_at", desc=True).execute().data
+
+@app.get("/api/shop-bills/pinned")
+def get_pinned_shop_bills(user=Depends(verify_token)):
+    return supabase.table("shop_bills").select("*").eq("is_pinned", True).order("created_at", desc=True).limit(20).execute().data
+
+@app.patch("/api/shop-bills/{bill_id}/payment")
+def update_shop_bill_payment(bill_id: str, payment_status: str, user=Depends(verify_token)):
+    supabase.table("shop_bills").update({"payment_status": payment_status}).eq("id", bill_id).execute()
+    return {"message": "Updated"}
+
+@app.delete("/api/shop-bills/{bill_id}")
+def delete_shop_bill(bill_id: str, user=Depends(verify_token)):
+    if user["role"] != "owner": raise HTTPException(status_code=403, detail="Owner only")
+    supabase.table("shop_bills").delete().eq("id", bill_id).execute()
+    return {"message": "Deleted"}
+
+# ── Quotations ──────────────────────────────────────────
+@app.post("/api/quotations")
+def create_quotation(q: Quotation, user=Depends(verify_token)):
+    qnum = generate_quotation_number()
+    now = datetime.now().isoformat()
+    data = {
+        "quotation_number": qnum, "created_at": now,
+        "customer_name": q.customer_name, "customer_phone": q.customer_phone,
+        "items": [i.dict() for i in q.items], "subtotal": q.subtotal,
+        "gst_enabled": q.gst_enabled, "gst_rate": q.gst_rate, "gst_amount": q.gst_amount,
+        "grand_total": q.grand_total, "created_by": user["username"]
+    }
+    result = supabase.table("quotations").insert(data).execute()
+    return {"quotation_number": qnum, "id": result.data[0]["id"]}
+
+@app.get("/api/quotations")
+def get_quotations(search: Optional[str]=None, user=Depends(verify_token)):
+    query = supabase.table("quotations").select("*")
+    if search: query = query.or_(f"customer_name.ilike.%{search}%,quotation_number.ilike.%{search}%")
+    return query.order("created_at", desc=True).execute().data
+
+@app.delete("/api/quotations/{qid}")
+def delete_quotation(qid: str, user=Depends(verify_token)):
+    if user["role"] != "owner": raise HTTPException(status_code=403, detail="Owner only")
+    supabase.table("quotations").delete().eq("id", qid).execute()
+    return {"message": "Deleted"}
+
+# ── Motors Registry (warranty registration) ──────────────
+@app.get("/api/motors")
+def get_motors(search: Optional[str]=None, user=Depends(verify_token)):
+    query = supabase.table("motors").select("*")
+    if search: query = query.or_(f"customer_name.ilike.%{search}%,serial_number.ilike.%{search}%,motor_name.ilike.%{search}%")
+    return query.order("created_at", desc=True).execute().data
+
+@app.patch("/api/motors/{motor_id}")
+def update_motor_serial(motor_id: str, serial_number: str, user=Depends(verify_token)):
+    supabase.table("motors").update({"serial_number": serial_number}).eq("id", motor_id).execute()
+    return {"message": "Updated"}
+
+# ── Dashboard ───────────────────────────────────────────
 @app.get("/api/dashboard")
 def get_dashboard(user=Depends(verify_token)):
     today = date.today().isoformat()
-    today_data = supabase.table("bills").select("*").gte(
-        "created_at", today).execute().data or []
-    credit_data = supabase.table("bills").select("*").eq(
-        "payment_status", "credit").execute().data or []
-    pinned = supabase.table("bills").select("*").eq(
-        "is_pinned", True).order("created_at", desc=True).limit(10).execute().data or []
+    today_data = supabase.table("bills").select("*").gte("created_at", today).execute().data or []
+    credit_data = supabase.table("bills").select("*").eq("payment_status", "credit").execute().data or []
+    pinned = supabase.table("bills").select("*").eq("is_pinned", True).order("created_at", desc=True).limit(10).execute().data or []
     return {
         "today_sales": sum(b["grand_total"] for b in today_data),
         "today_bill_count": len(today_data),
@@ -427,9 +520,7 @@ def get_dashboard(user=Depends(verify_token)):
 
 @app.get("/api/reports/summary")
 def get_report(period: str="monthly", user=Depends(verify_token)):
-    if user["role"] != "owner":
-        raise HTTPException(status_code=403, detail="Owner only")
-    from datetime import timedelta
+    if user["role"] != "owner": raise HTTPException(status_code=403, detail="Owner only")
     now = datetime.now()
     start = now.replace(hour=0,minute=0,second=0).isoformat() if period=="daily" else \
             (now-timedelta(days=7)).isoformat() if period=="weekly" else \
@@ -441,8 +532,7 @@ def get_report(period: str="monthly", user=Depends(verify_token)):
             item_sales[item["item_name"]] = item_sales.get(item["item_name"], 0) + item["amount"]
     top = sorted(item_sales.items(), key=lambda x: x[1], reverse=True)[:10]
     return {
-        "period": period,
-        "total_revenue": sum(b["grand_total"] for b in data),
+        "period": period, "total_revenue": sum(b["grand_total"] for b in data),
         "total_gst_collected": sum(b.get("gst_amount", 0) for b in data),
         "bill_count": len(data),
         "paid_count": len([b for b in data if b["payment_status"]=="paid"]),
@@ -458,13 +548,11 @@ def get_customers(search: Optional[str]=None, user=Depends(verify_token)):
 
 @app.get("/api/customers/{phone}/bills")
 def get_customer_bills(phone: str, user=Depends(verify_token)):
-    return supabase.table("bills").select("*").eq(
-        "customer_phone", phone).order("created_at", desc=True).execute().data
+    return supabase.table("bills").select("*").eq("customer_phone", phone).order("created_at", desc=True).execute().data
 
 @app.get("/api/credit-reminders")
 def get_reminders(user=Depends(verify_token)):
-    return supabase.table("credit_reminders").select("*").eq(
-        "status", "active").order("created_at", desc=True).execute().data
+    return supabase.table("credit_reminders").select("*").eq("status", "active").order("created_at", desc=True).execute().data
 
 @app.get("/api/health")
 def health():

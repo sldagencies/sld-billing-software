@@ -7,18 +7,23 @@ import CustomerLedger from "./pages/CustomerLedger";
 import CreditPending from "./pages/CreditPending";
 import Reports from "./pages/Reports";
 import Settings from "./pages/Settings";
+import ShopBilling from "./pages/ShopBilling";
+import Quotation from "./pages/Quotation";
 import Navbar from "./components/Navbar";
 
+// SECURITY: sessionStorage clears automatically when the browser/tab is
+// fully closed — so the app always asks for the password again on next open.
+// (localStorage would have kept the user logged in indefinitely.)
 export default function App() {
-  const [token, setToken] = useState(localStorage.getItem("sld_token"));
-  const [role, setRole] = useState(localStorage.getItem("sld_role"));
-  const [username, setUsername] = useState(localStorage.getItem("sld_user"));
+  const [token, setToken] = useState(sessionStorage.getItem("sld_token"));
+  const [role, setRole] = useState(sessionStorage.getItem("sld_role"));
+  const [username, setUsername] = useState(sessionStorage.getItem("sld_user"));
   const [page, setPage] = useState("dashboard");
 
   const handleLogin = (data) => {
-    localStorage.setItem("sld_token", data.access_token);
-    localStorage.setItem("sld_role", data.role);
-    localStorage.setItem("sld_user", data.username);
+    sessionStorage.setItem("sld_token", data.access_token);
+    sessionStorage.setItem("sld_role", data.role);
+    sessionStorage.setItem("sld_user", data.username);
     setToken(data.access_token);
     setRole(data.role);
     setUsername(data.username);
@@ -26,7 +31,7 @@ export default function App() {
   };
 
   const handleLogout = () => {
-    localStorage.clear();
+    sessionStorage.clear();
     setToken(null); setRole(null); setUsername(null);
   };
 
@@ -35,6 +40,8 @@ export default function App() {
   const pages = {
     dashboard: <Dashboard token={token} role={role} navigate={setPage} />,
     newbill: <NewBill token={token} role={role} navigate={setPage} />,
+    shopbilling: <ShopBilling token={token} role={role} />,
+    quotation: <Quotation token={token} role={role} />,
     history: <BillsHistory token={token} role={role} navigate={setPage} />,
     customers: <CustomerLedger token={token} role={role} />,
     credit: <CreditPending token={token} role={role} />,
