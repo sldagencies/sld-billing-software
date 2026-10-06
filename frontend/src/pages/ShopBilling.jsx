@@ -1,10 +1,10 @@
-import { useState, useEffect, useRef } from "react";
-import { createShopBill, getShopBills, getPinnedShopBills, updateShopBillPayment, deleteShopBill, formatINR, formatDate } from "../api";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { searchProducts, createShopBill, getShopBills, updateShopBillPayment, deleteShopBill, formatINR, formatDate } from "../api";
 
 const EMPTY_ITEM = { item_name: "", unit: "", qty: "", rate: "", amount: 0 };
 
 export default function ShopBilling({ token, role }) {
-  const [view, setView] = useState("new"); // "new" | "list"
+  const [view, setView] = useState("new");
   const [shop, setShop] = useState({ name: "", phone: "", address: "" });
   const [items, setItems] = useState([{ ...EMPTY_ITEM }]);
   const [payStatus, setPayStatus] = useState("credit");
@@ -14,8 +14,13 @@ export default function ShopBilling({ token, role }) {
   const [bills, setBills] = useState([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState("");
-  const qtyRefs = useRef({});
+  const [searchResults, setSearchResults] = useState([]);
+  const [searchIdx, setSearchIdx] = useState(null);
+  const [dropdownPos, setDropdownPos] = useState({ top: 0, left: 0, width: 0 });
+  const debounceRef = useRef(null);
   const nameRefs = useRef({});
+  const qtyRefs = useRef({});
+  const rateRefs = useRef({});
 
   const subtotal = items.reduce((s, i) => s + (parseFloat(i.amount) || 0), 0);
 
@@ -32,12 +37,48 @@ export default function ShopBilling({ token, role }) {
     });
   };
 
+  // Item search from the price list — names only, the price is NOT fetched
+  const handleSearch = useCallback((idx, q) => {
+    updateItem(idx, "item_name", q);
+    setSearchIdx(idx);
+    clearTimeout(debounceRef.current);
+    if (!q) { setSearchResults([]); return; }
+    const el = nameRefs.current[idx];
+    if (el) {
+      const rect = el.getBoundingClientRect();
+      const spaceBelow = window.innerHeight - rect.bottom;
+      if (spaceBelow < 320 && rect.top > 320) {
+        setDropdownPos({ bottom: window.innerHeight - rect.top + 2, top: "auto", left: rect.left, width: rect.width });
+      } else {
+        setDropdownPos({ top: rect.bottom + 2, bottom: "auto", left: rect.left, width: rect.width });
+      }
+    }
+    debounceRef.current = setTimeout(async () => {
+      try { setSearchResults(await searchProducts(q, token)); }
+      catch { setSearchResults([]); }
+    }, 200);
+  }, [token]);
+
+  const selectProduct = (idx, product) => {
+    setItems(prev => {
+      const updated = [...prev];
+      updated[idx] = { ...updated[idx], item_name: product.item_name, unit: product.unit };
+      return updated;
+    });
+    setSearchResults([]);
+    setSearchIdx(null);
+    setTimeout(() => qtyRefs.current[idx]?.focus(), 50);
+  };
+
   const addRow = () => {
     setItems(prev => [...prev, { ...EMPTY_ITEM }]);
-    setTimeout(() => { nameRefs.current[items.length]?.focus(); }, 60);
+    setTimeout(() => nameRefs.current[items.length]?.focus(), 60);
   };
   const removeRow = (idx) => { if (items.length > 1) setItems(prev => prev.filter((_, i) => i !== idx)); };
-  const handleKeyDown = (e) => { if (e.key === "Enter") { e.preventDefault(); addRow(); } };
+
+  // Enter in Qty -> go to Rate. Enter in Rate -> add next row.
+  const onQtyKey = (e, idx) => { if (e.key === "Enter") { e.preventDefault(); rateRefs.current[idx]?.focus(); } };
+  const onRateKey = (e) => { if (e.key === "Enter") { e.preventDefault(); addRow(); } };
 
   const loadList = async () => {
     setLoading(true);
@@ -45,12 +86,11 @@ export default function ShopBilling({ token, role }) {
     catch (e) { console.error(e); }
     finally { setLoading(false); }
   };
-
   useEffect(() => { if (view === "list") loadList(); }, [view, search]);
 
   const handleSave = async () => {
     if (!shop.name) { setMsg("Please enter shop name"); return; }
-    const validItems = items.filter(i => i.item_name && i.rate > 0);
+    const validItems = items.filter(i => i.item_name && parseFloat(i.rate) > 0);
     if (validItems.length === 0) { setMsg("Please add at least one item with a rate"); return; }
     setSaving(true); setMsg("");
     try {
@@ -71,7 +111,6 @@ export default function ShopBilling({ token, role }) {
     try { await updateShopBillPayment(bill.id, "paid", token); loadList(); }
     catch { setMsg("Failed to update"); }
   };
-
   const handleDelete = async (bill) => {
     if (!window.confirm(`Delete bill for ${bill.shop_name}?`)) return;
     try { await deleteShopBill(bill.id, token); loadList(); }
@@ -84,6 +123,27 @@ export default function ShopBilling({ token, role }) {
 
   return (
     <div>
+      {searchIdx !== null && searchResults.length > 0 && (
+        <div style={{
+          position: "fixed",
+          top: dropdownPos.top !== "auto" ? dropdownPos.top : "auto",
+          bottom: dropdownPos.bottom !== "auto" ? dropdownPos.bottom : "auto",
+          left: dropdownPos.left, width: dropdownPos.width, background: "#fff",
+          border: "2px solid #1A4480", borderRadius: 10, zIndex: 99999,
+          maxHeight: 320, overflowY: "auto", boxShadow: "0 12px 40px rgba(0,0,0,0.2)"
+        }}>
+          {searchResults.map((r, ri) => (
+            <div key={ri} onMouseDown={() => selectProduct(searchIdx, r)}
+              style={{ padding: "11px 16px", cursor: "pointer", borderBottom: "1px solid #f1f5f9", background: "#fff" }}
+              onMouseEnter={e => e.currentTarget.style.background = "#eff6ff"}
+              onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
+              <div style={{ fontWeight: 600, fontSize: 14, color: "#0B1F3A" }}>{r.item_name}</div>
+              <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>{r.tab} &bull; {r.unit}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
         <h1 style={{ fontSize: 22, fontWeight: 800, color: "#0B1F3A", margin: 0 }}>Shop Billing</h1>
         <div style={segGroup}>
@@ -113,7 +173,7 @@ export default function ShopBilling({ token, role }) {
           <div style={{ background: "#fff", borderRadius: 14, padding: 20, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.06)" }}>
             <h3 style={{ margin: "0 0 14px", color: "#0B1F3A", fontSize: 15, fontWeight: 700 }}>Items</h3>
             <div style={{ fontSize: 12, color: "#92400e", background: "#fffbeb", padding: "8px 12px", borderRadius: 8, marginBottom: 12 }}>
-              Note: Enter item name and rate manually — prices are not auto-fetched for shop billing.
+              Search the item name from the price list, then type the quantity and the rate yourself. Prices are not auto-filled for shop bills.
             </div>
             <div style={{ overflowX: "auto" }}>
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
@@ -128,22 +188,24 @@ export default function ShopBilling({ token, role }) {
                   {items.map((item, idx) => (
                     <tr key={idx} style={{ background: idx % 2 === 0 ? "#f8fafc" : "#fff", borderBottom: "1px solid #e2e8f0" }}>
                       <td style={{ padding: "8px 12px", fontWeight: 700, color: "#1A4480", width: 46 }}>{idx + 1}</td>
-                      <td style={{ padding: "6px 8px", minWidth: 220 }}>
+                      <td style={{ padding: "6px 8px", minWidth: 260 }}>
                         <input ref={el => nameRefs.current[idx] = el} value={item.item_name}
-                          onChange={e => updateItem(idx, "item_name", e.target.value)}
-                          placeholder="Item name" style={{ ...inp, padding: "7px 10px" }} />
+                          onChange={e => handleSearch(idx, e.target.value)}
+                          onFocus={() => { setSearchIdx(idx); if (item.item_name) handleSearch(idx, item.item_name); }}
+                          onBlur={() => setTimeout(() => { setSearchResults([]); setSearchIdx(null); }, 200)}
+                          onKeyDown={e => { if (e.key === "Escape") { setSearchResults([]); setSearchIdx(null); } }}
+                          placeholder="Type to search..." autoComplete="off"
+                          style={{ ...inp, padding: "7px 10px" }} />
                       </td>
-                      <td style={{ padding: "6px 8px", width: 110 }}>
-                        <input value={item.unit} onChange={e => updateItem(idx, "unit", e.target.value)}
-                          placeholder="Unit" style={{ ...inp, padding: "7px 10px" }} />
-                      </td>
-                      <td style={{ padding: "6px 8px", width: 80 }}>
+                      <td style={{ padding: "8px 10px", color: "#64748b", fontSize: 13, whiteSpace: "nowrap", minWidth: 90 }}>{item.unit}</td>
+                      <td style={{ padding: "6px 8px", width: 90 }}>
                         <input ref={el => qtyRefs.current[idx] = el} value={item.qty}
-                          onChange={e => updateItem(idx, "qty", e.target.value)} onKeyDown={handleKeyDown}
+                          onChange={e => updateItem(idx, "qty", e.target.value)} onKeyDown={e => onQtyKey(e, idx)}
                           placeholder="Qty" style={{ width: "100%", padding: "7px 8px", border: "1.5px solid #e2e8f0", borderRadius: 6, fontSize: 14, textAlign: "center", outline: "none" }} />
                       </td>
-                      <td style={{ padding: "6px 8px", width: 110 }}>
-                        <input value={item.rate} onChange={e => updateItem(idx, "rate", e.target.value)}
+                      <td style={{ padding: "6px 8px", width: 120 }}>
+                        <input ref={el => rateRefs.current[idx] = el} value={item.rate}
+                          onChange={e => updateItem(idx, "rate", e.target.value)} onKeyDown={onRateKey}
                           placeholder="Rate" style={{ width: "100%", padding: "7px 8px", border: "1.5px solid #e2e8f0", borderRadius: 6, fontSize: 14, outline: "none" }} />
                       </td>
                       <td style={{ padding: "8px 10px", fontWeight: 700, color: "#059669", whiteSpace: "nowrap" }}>Rs.{formatINR(item.amount)}</td>
@@ -156,7 +218,7 @@ export default function ShopBilling({ token, role }) {
               </table>
             </div>
             <button onClick={addRow} style={{ marginTop: 10, background: "#eff6ff", border: "2px dashed #1A4480", borderRadius: 8, padding: "9px 0", fontSize: 13, fontWeight: 600, color: "#1A4480", cursor: "pointer", width: "100%" }}>
-              + Add Item &nbsp;(or press Enter after entering quantity)
+              + Add Item &nbsp;(or press Enter after typing the rate)
             </button>
           </div>
 

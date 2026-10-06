@@ -53,7 +53,7 @@ export default function Settings({ token, role }) {
           {[
             { label: "Business Name", value: "Sree Laxmidurga Agencies" },
             { label: "Phone", value: "8019093618" },
-            { label: "Email", value: "sreelaxmidurgaagencies@gmail.com" },
+            { label: "Email", value: "sldagencies09@gmail.com" },
             { label: "Website", value: "www.sreelaxmidurga.in" },
             { label: "Address", value: "Yemmiganur, Kurnool District, AP — 518 360" },
             { label: "Serving Since", value: "2009" },
