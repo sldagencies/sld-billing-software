@@ -100,7 +100,7 @@ export default function BillPrint({ bill }) {
               Your Trusted Partner for Water Solutions
             </div>
             <div>📞 8019093618</div>
-            <div>✉️ sreelaxmidurgaagencies@gmail.com</div>
+            <div>✉️ sldagencies09@gmail.com</div>
             <div>🌐 www.sreelaxmidurga.in</div>
             <div>📍 518 360, Kurnool District, Andhra Pradesh</div>
           </div>

@@ -66,7 +66,7 @@ export default function Login({ onLogin }) {
             Sree Laxmidurga Agencies
           </h1>
           <p style={{ color: "rgba(255,255,255,0.65)", fontSize: 13, margin: 0 }}>
-            Billing Software — Yemmiganur
+            Billing - Yemmiganur
           </p>
         </div>
 
@@ -76,7 +76,7 @@ export default function Login({ onLogin }) {
             <div style={{ marginBottom: 16 }}>
               <label style={{ fontSize: 13, fontWeight: 600, color: "#374151", display: "block", marginBottom: 6 }}>Username</label>
               <input value={username} onChange={e => setUsername(e.target.value)}
-                placeholder="owner  /  worker" style={inp}
+                placeholder="owner  /  manager" style={inp}
                 onFocus={e => e.target.style.borderColor = "#1A4480"}
                 onBlur={e => e.target.style.borderColor = "#d1d5db"} />
             </div>

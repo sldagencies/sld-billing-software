@@ -24,7 +24,7 @@ SECRET_KEY = os.getenv("JWT_SECRET", "sld-billing-secret-2024")
 security = HTTPBearer()
 USERS = {
     "owner": {"password": os.getenv("OWNER_PASSWORD", "owner123"), "role": "owner"},
-    "worker": {"password": os.getenv("WORKER_PASSWORD", "worker123"), "role": "worker"},
+    "manager": {"password": os.getenv("MANAGER_PASSWORD", "manager123"), "role": "manager"},
 }
 
 def get_sheets_service():
